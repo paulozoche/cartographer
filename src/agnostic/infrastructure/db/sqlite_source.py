@@ -15,6 +15,17 @@ class SQLiteDataSource:
             self.connection.execute("PRAGMA cache_size = -2000;")
         return self.connection
 
+    def get_metadata(self):
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+        return {
+            "tables": tables,
+            "total_tables": len(tables),
+            "db_path": self.db_path
+        }
+
     def list_units(self) -> list["SQLiteTabularUnit"]:
         conn = self.connect()
         cursor = conn.cursor()
