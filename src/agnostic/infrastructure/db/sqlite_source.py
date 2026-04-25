@@ -26,3 +26,17 @@ class SQLiteDataSource:
         if self.connection:
             self.connection.close()
             self.connection = None
+
+class SQLiteTabularUnit:
+    def __init__(self, name: str, db_path: Path):
+        self.name = name
+        self.db_path = db_path
+
+    def load_data(self) -> dict[str, list]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM {self.name}")
+        columns = [description[0] for description in cursor.description]
+        data = cursor.fetchall()
+        conn.close()
+        return {column: [row[i] for row in data] for i, column in enumerate(columns)}
