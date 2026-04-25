@@ -1,0 +1,48 @@
+# =============================
+# SISTEMA / LIXO
+# =============================
+venv/
+__pycache__/
+*.pyc
+
+# =============================
+# TESTES (ENORME ganho de contexto)
+# =============================
+tests/
+
+# =============================
+# DADOS / ARQUIVOS
+# =============================
+*.db
+*.csv
+*.parquet
+
+# =============================
+# CORE PESADO (IGNORE POR PADRÃO)
+# =============================
+src/agnostic/domain/
+src/agnostic/core/
+
+# =============================
+# INFRA E STORAGE
+# =============================
+src/agnostic/infrastructure/storage/
+src/agnostic/infrastructure/db/
+
+# =============================
+# DOCUMENTAÇÃO SECUNDÁRIA
+# =============================
+docs/TRANSITION.md
+docs/METHOD.md
+docs/LEGACY.md
+
+docs/HEURISTICS_PACKAGE.md
+docs/METRICS_LAYER1.md
+docs/METRICS_LAYER2.md
+docs/METRICS_LAYERS.md
+docs/INPUT_LAYER.md
+
+# =============================
+# OPCIONAL (dependendo do foco)
+# =============================
+# docs/AI.md

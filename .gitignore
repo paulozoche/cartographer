@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+.pytest_cache/
+.env
+
+# Dados
+data/*.db
+data/raw/
+data/processed/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Workspace notes
+comandos.txt
+conversa.txt
+
+# OS
+.DS_Store
+.aider*
