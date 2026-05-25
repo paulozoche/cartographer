@@ -7,8 +7,8 @@ from pydantic import model_validator
 from typing import Literal
 from typing import Any
 
-from agnostic.application.policies import is_valid_share_id
-from agnostic.application.policies import validate_recorte_transition_destinations
+from agnostic.navigation.transitions.recorte_transition_policy import validate_recorte_transition_destinations
+from agnostic.sharing.policies.share_id_policy import is_valid_share_id
 
 
 class AIConsultRequest(BaseModel):

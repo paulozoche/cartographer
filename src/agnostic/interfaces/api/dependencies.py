@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi import status
 from agnostic.application import verify_share_link_signature_v1
-from agnostic.application.ports.revocation_store import RevocationStore
+from agnostic.sharing.ports.revocation_store import RevocationStore
 from agnostic.config import load_app_config
 from agnostic.infrastructure.ai.grok_client import build_ai_client_from_env
 from agnostic.infrastructure.storage.revocation_store import InMemoryRevocationStore

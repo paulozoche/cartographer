@@ -12,12 +12,11 @@ from fastapi.responses import Response
 
 from agnostic.application import analyze_tabular_unit, consult_ai, summarize_tabular_analysis
 from agnostic.application import render_canonical_analysis_markdown
-from agnostic.application.use_cases.runtime_analysis import (
+from agnostic.application.use_cases.source_result import (
     build_source_result as run_build_source_result,
-    build_tabular_result as run_build_tabular_result,
 )
-from agnostic.application.use_cases.summarize_tabular_analysis import summarize_unit_metrics
-from agnostic.application.ports.ai_orchestrator import AIOrchestrator
+from agnostic.application.use_cases.tabular_result import build_tabular_result as run_build_tabular_result
+from agnostic.ai.ports.ai_orchestrator import AIOrchestrator
 from agnostic.config import load_app_config
 from agnostic.core import attach_internal_cuts as core_attach_internal_cuts
 from agnostic.core import resolve_optional_limit as core_resolve_optional_limit
@@ -28,6 +27,7 @@ from agnostic.infrastructure.db.sqlite_source import SQLiteDataSource
 from agnostic.infrastructure.storage.csv_source import CSVDataSource
 from agnostic.infrastructure.storage.parquet_source import ParquetDataSource
 from agnostic.interfaces.api.dependencies import get_ai_client
+from agnostic.presentation.summaries.summarize_tabular_analysis import summarize_unit_metrics
 from agnostic.interfaces.api.schemas import (
     AIConsultRequest,
     AIConsultResponse,

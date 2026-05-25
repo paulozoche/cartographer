@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from agnostic.application import analyze_tabular_unit
-from agnostic.application.use_cases.summarize_tabular_analysis import summarize_unit_metrics
+from agnostic.domain.analysis.analyze_tabular_unit import analyze_tabular_unit
 from agnostic.domain.models.tabular import UnitMetadata, UnitStructure, ColumnStructure
+from agnostic.presentation.summaries.summarize_tabular_analysis import summarize_unit_metrics
 
 
 class _MemoryUnit:

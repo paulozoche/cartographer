@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from agnostic.application import consult_ai
+from agnostic.ai.consult_ai import consult_ai
 from agnostic.infrastructure.ai import (
     AIQuotaExceeded,
     GroqAPIError,

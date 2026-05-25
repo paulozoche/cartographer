@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 from pathlib import Path
 
-from agnostic.application.ports.ai_orchestrator import AIResponse
+from agnostic.ai.ports.ai_orchestrator import AIResponse
 from agnostic.infrastructure.ai.grok_client import GroqAPIError
 from agnostic.interfaces.api.dependencies import get_ai_client
 from agnostic.interfaces.api import create_app

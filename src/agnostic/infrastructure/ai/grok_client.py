@@ -8,7 +8,7 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from agnostic.config import AIConfig, load_app_config
-from agnostic.application.ports.ai_orchestrator import AIResponse
+from agnostic.ai.ports.ai_orchestrator import AIResponse
 
 
 class AIQuotaExceeded(RuntimeError):

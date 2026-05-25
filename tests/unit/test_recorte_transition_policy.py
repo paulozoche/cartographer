@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import pytest
 
-from agnostic.application.policies import CANONICAL_RECORTE_TRANSITION_MATRIX
-from agnostic.application.policies import allowed_destinations_for_recorte_type
-from agnostic.application.policies import validate_recorte_transition_destinations
+from agnostic.navigation.transitions.recorte_transition_policy import CANONICAL_RECORTE_TRANSITION_MATRIX
+from agnostic.navigation.transitions.recorte_transition_policy import allowed_destinations_for_recorte_type
+from agnostic.navigation.transitions.recorte_transition_policy import validate_recorte_transition_destinations
 
 
 def test_canonical_transition_matrix_matches_flow_contract() -> None:
     assert CANONICAL_RECORTE_TRANSITION_MATRIX == {
         "dominancia": frozenset({"subconjunto", "recorte", "valor_celula"}),
         "excecao": frozenset({"recorte", "valor_celula"}),
+        "conflito": frozenset({"recorte", "valor_celula"}),
         "ausencia": frozenset({"subconjunto", "valor_celula"}),
         "padrao": frozenset({"subconjunto", "recorte", "valor_celula"}),
         "identidade_estrutural": frozenset({"recorte", "valor_celula"}),

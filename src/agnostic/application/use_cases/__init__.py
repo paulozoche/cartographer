@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from agnostic.application.use_cases.analyze_tabular_unit import (
+from agnostic.domain.analysis.analyze_tabular_unit import (
     ColumnAnalysis,
     TabularUnitAnalysis,
     analyze_tabular_unit,
 )
-from agnostic.application.use_cases.build_share_link_envelope_v1 import build_share_link_envelope_v1
-from agnostic.application.use_cases.build_share_link_envelope_v1 import canonicalize_share_state_v1
-from agnostic.application.use_cases.build_share_link_envelope_v1 import compute_share_state_hash_v1
-from agnostic.application.use_cases.build_share_state_v1 import build_share_state_v1
-from agnostic.application.use_cases.consult_ai import consult_ai
-from agnostic.application.use_cases.persist_canonical_result import persist_canonical_result
-from agnostic.application.use_cases.render_canonical_analysis_markdown import render_canonical_analysis_markdown
-from agnostic.application.use_cases.summarize_tabular_analysis import summarize_tabular_analysis
+from agnostic.ai.consult_ai import consult_ai
+from agnostic.infrastructure.export.persist_canonical_result import persist_canonical_result
+from agnostic.presentation.markdown.render_canonical_analysis_markdown import (
+    render_canonical_analysis_markdown,
+)
+from agnostic.presentation.summaries.summarize_tabular_analysis import summarize_tabular_analysis
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import build_share_link_envelope_v1
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import canonicalize_share_state_v1
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import compute_share_state_hash_v1
+from agnostic.sharing.state.build_share_state_v1 import build_share_state_v1
 
 __all__ = [
     "ColumnAnalysis",

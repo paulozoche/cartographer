@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from agnostic.application.policies import ShareSigningKey
-from agnostic.application.policies import build_verification_keyring
-from agnostic.application.policies import resolve_signing_key
-from agnostic.application.policies import validate_share_signing_keys
+from agnostic.sharing.policies.share_key_rotation_policy import ShareSigningKey
+from agnostic.sharing.policies.share_key_rotation_policy import build_verification_keyring
+from agnostic.sharing.policies.share_key_rotation_policy import resolve_signing_key
+from agnostic.sharing.policies.share_key_rotation_policy import validate_share_signing_keys
 
 
 def test_resolve_signing_key_returns_single_active_key() -> None:

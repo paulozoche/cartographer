@@ -1,4 +1,4 @@
-from agnostic.application.use_cases.data_slices import (
+from agnostic.navigation.slices.data_slices import (
     DataContext,
     FilterCondition,
     build_query,

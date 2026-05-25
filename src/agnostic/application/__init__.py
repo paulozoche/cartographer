@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-from agnostic.application.use_cases.analyze_tabular_unit import (
+from agnostic.domain.analysis.analyze_tabular_unit import (
     ColumnAnalysis,
     TabularUnitAnalysis,
     analyze_tabular_unit,
 )
-from agnostic.application.policies import ShareSigningKey
-from agnostic.application.use_cases.build_share_link_envelope_v1 import build_share_link_envelope_v1
-from agnostic.application.use_cases.build_share_link_envelope_v1 import canonicalize_share_state_v1
-from agnostic.application.use_cases.build_share_link_envelope_v1 import compute_share_state_hash_v1
-from agnostic.application.use_cases.build_share_state_v1 import build_share_state_v1
-from agnostic.application.use_cases.consult_ai import consult_ai
-from agnostic.application.use_cases.persist_canonical_result import persist_canonical_result
-from agnostic.application.use_cases.render_canonical_analysis_markdown import render_canonical_analysis_markdown
-from agnostic.application.use_cases.summarize_tabular_analysis import summarize_tabular_analysis
-from agnostic.application.services import (
+from agnostic.ai.consult_ai import consult_ai
+from agnostic.sharing.services.share_link_signature import (
     SIGNATURE_VERSION,
     attach_share_link_signature_with_rotation_v1,
     attach_share_link_signature_v1,
@@ -24,6 +16,16 @@ from agnostic.application.services import (
     verify_share_link_signature_v1,
     verify_share_state_hash_v1,
 )
+from agnostic.sharing.policies.share_key_rotation_policy import ShareSigningKey
+from agnostic.infrastructure.export.persist_canonical_result import persist_canonical_result
+from agnostic.presentation.markdown.render_canonical_analysis_markdown import (
+    render_canonical_analysis_markdown,
+)
+from agnostic.presentation.summaries.summarize_tabular_analysis import summarize_tabular_analysis
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import build_share_link_envelope_v1
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import canonicalize_share_state_v1
+from agnostic.sharing.envelope.build_share_link_envelope_v1 import compute_share_state_hash_v1
+from agnostic.sharing.state.build_share_state_v1 import build_share_state_v1
 
 __all__ = [
     "ColumnAnalysis",
