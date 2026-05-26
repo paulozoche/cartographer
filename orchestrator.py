@@ -4,6 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 import json
 import os
+import re
 import sqlite3
 import sys
 from urllib import request as urllib_request
@@ -64,6 +65,25 @@ QUERY_CATALOG = {
         FROM khipu_main
         WHERE EARLIEST_AGE != '0000-00-00' AND EARLIEST_AGE IS NOT NULL
         ORDER BY EARLIEST_AGE
+    """,
+    "globalid_by_country": """
+        SELECT "Country", COUNT(*) as total
+        FROM globalid GROUP BY "Country" ORDER BY total DESC LIMIT 20
+    """,
+    "globalid_by_region": """
+        SELECT "Political province/region", COUNT(*) as total
+        FROM globalid GROUP BY "Political province/region" ORDER BY total DESC LIMIT 20
+    """,
+    "globalid_age_distribution": """
+        SELECT
+            MIN(CAST("Model_Age_SK75" AS REAL)) as min_age,
+            MAX(CAST("Model_Age_SK75" AS REAL)) as max_age,
+            AVG(CAST("Model_Age_SK75" AS REAL)) as avg_age
+        FROM globalid WHERE "Model_Age_SK75" != ''
+    """,
+    "globalid_sample_types": """
+        SELECT "Type", COUNT(*) as total
+        FROM globalid GROUP BY "Type" ORDER BY total DESC
     """,
 }
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -168,6 +188,8 @@ class OrchestratorSession:
         self.history: list[dict[str, str]] = []
         self._full_structural_context: str | None = None
         self._curator_cache: dict[str, dict[str, object]] = {}
+        self._session_query_catalog: dict[str, str] = {}
+        self._candidate_queries: list[tuple[str, str]] = []
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY não encontrada. Verifique o arquivo .env.")
@@ -290,6 +312,7 @@ class OrchestratorSession:
         last_error: str | None = None,
         last_result: str | None = None,
         executed_queries: list[str] | None = None,
+        query_catalog: list[str] | None = None,
         attempt_number: int = 1,
     ) -> dict[str, object]:
         system_prompt = (
@@ -297,14 +320,16 @@ class OrchestratorSession:
             "Responda somente com JSON válido, sem markdown e sem texto extra.\n"
             "A saída deve seguir exatamente um destes contratos:\n"
             '{"action":"query","query_id":"knot_type_distribution"}\n'
+            '{"action":"request_new_query","description":"descricao","suggested_sql":"SELECT ..."}\n'
             '{"action":"schema","table":"nome_da_tabela"}\n'
             '{"action":"tables"}\n'
             '{"action":"done","conclusion":"texto"}\n'
             "Nunca converse com o usuário.\n"
             "Nunca gere SQL livremente.\n"
             "Para action=query, escolha apenas um query_id existente no catálogo disponível.\n"
+            "Use action=request_new_query apenas quando a análise pedida não existir no catálogo disponível.\n"
             "Nunca emita 'done' quando o resultado ou contexto de erro contiver 'erro' ou 'error'.\n"
-            "Em caso de erro de consulta, tente outro query_id do catálogo apenas se ele responder melhor à pergunta.\n"
+            "Em caso de erro de consulta, tente outro query_id do catálogo ou request_new_query apenas se isso responder melhor à pergunta.\n"
             "Nunca emita 'done' quando a mensagem do usuário for apenas uma confirmação curta como 'sim', 'ok', 'continue' ou 'prossiga'.\n"
             "Se já existir resultado válido no turno atual, use esse resultado para decidir a próxima ação e não reexecute o mesmo query_id.\n"
             "Só emita 'done' quando houver uma conclusão real e bem-sucedida.\n"
@@ -321,6 +346,7 @@ class OrchestratorSession:
             last_error=last_error,
             last_result=last_result,
             executed_queries=executed_queries or [],
+            query_catalog=query_catalog or sorted(self.catalog_for_session().keys()),
             attempt_number=attempt_number,
         )
         response = self.orchestrator_ai.send(prompt, system_prompt=system_prompt)
@@ -343,6 +369,15 @@ class OrchestratorSession:
         if action == "query":
             query_id = str(action_payload["query_id"])
             return json.dumps(self._run_catalog_query(query_id), ensure_ascii=False, indent=2, default=str)
+        if action == "request_new_query":
+            description = str(action_payload["description"])
+            suggested_sql = str(action_payload["suggested_sql"])
+            return json.dumps(
+                self._register_session_query(description=description, suggested_sql=suggested_sql),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
         if action == "done":
             return str(action_payload["conclusion"])
         raise ValueError(f"Ação não suportada: {action}")
@@ -368,7 +403,7 @@ class OrchestratorSession:
     def _run_catalog_query(self, query_id: str) -> dict[str, object]:
         if self.source_type != "sqlite":
             raise ValueError("Ação query está disponível apenas para fontes SQLite neste MVP.")
-        sql = QUERY_CATALOG.get(query_id)
+        sql = self.catalog_for_session().get(query_id)
         if sql is None:
             raise ValueError(f"Query do catálogo não encontrada: {query_id}")
         with sqlite3.connect(self.source_path) as connection:
@@ -378,6 +413,47 @@ class OrchestratorSession:
         return {
             "query_id": query_id,
             "sql": sql,
+            "columns": column_names,
+            "rows": rows,
+            "row_count_preview": len(rows),
+            "truncated": len(rows) == 50,
+        }
+
+    def catalog_for_session(self) -> dict[str, str]:
+        return {
+            **QUERY_CATALOG,
+            **getattr(self, "_session_query_catalog", {}),
+        }
+
+    def _register_session_query(self, *, description: str, suggested_sql: str) -> dict[str, object]:
+        if self.source_type != "sqlite":
+            raise ValueError("Queries novas em sessão estão disponíveis apenas para fontes SQLite neste MVP.")
+        validated_sql = validate_select_sql_text(suggested_sql)
+        preview = self._validate_and_preview_sql(validated_sql)
+        query_id = generate_query_id(description, existing_ids=set(self.catalog_for_session().keys()))
+        self._session_query_catalog[query_id] = validated_sql
+        candidate = (query_id, validated_sql)
+        if candidate not in self._candidate_queries:
+            self._candidate_queries.append(candidate)
+        return {
+            "query_id": query_id,
+            "description": description.strip(),
+            "sql": validated_sql,
+            "columns": preview["columns"],
+            "rows": preview["rows"],
+            "row_count_preview": preview["row_count_preview"],
+            "truncated": preview["truncated"],
+            "registered_in_session": True,
+        }
+
+    def _validate_and_preview_sql(self, sql: str) -> dict[str, object]:
+        with sqlite3.connect(self.source_path) as connection:
+            cursor = connection.execute(sql)
+            column_names = [item[0] for item in cursor.description or ()]
+            rows = cursor.fetchmany(50)
+        if not rows:
+            raise ValueError("A nova query foi rejeitada porque não retornou linhas.")
+        return {
             "columns": column_names,
             "rows": rows,
             "row_count_preview": len(rows),
@@ -444,6 +520,7 @@ def build_orchestrator_prompt(
     last_error: str | None = None,
     last_result: str | None = None,
     executed_queries: list[str] | None = None,
+    query_catalog: list[str] | None = None,
     attempt_number: int = 1,
 ) -> str:
     payload = {
@@ -458,9 +535,10 @@ def build_orchestrator_prompt(
         "last_error": last_error or "",
         "last_result": last_result or "",
         "executed_queries": executed_queries or [],
-        "query_catalog": sorted(QUERY_CATALOG.keys()),
+        "query_catalog": query_catalog or sorted(set(QUERY_CATALOG.keys())),
         "allowed_actions": [
             {"action": "query", "query_id": "knot_type_distribution"},
+            {"action": "request_new_query", "description": "descricao", "suggested_sql": "SELECT ..."},
             {"action": "schema", "table": "nome_da_tabela"},
             {"action": "tables"},
             {"action": "done", "conclusion": "texto da conclusão"},
@@ -503,9 +581,19 @@ def parse_orchestrator_json(raw_content: str) -> dict[str, object]:
         if not isinstance(query_id, str) or not query_id.strip():
             raise ValueError("Ação query exige o campo 'query_id'.")
         normalized = query_id.strip()
-        if normalized not in QUERY_CATALOG:
-            raise ValueError(f"query_id inválido: {normalized}")
         return {"action": "query", "query_id": normalized}
+    if action == "request_new_query":
+        description = payload.get("description")
+        suggested_sql = payload.get("suggested_sql")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("Ação request_new_query exige o campo 'description'.")
+        if not isinstance(suggested_sql, str) or not suggested_sql.strip():
+            raise ValueError("Ação request_new_query exige o campo 'suggested_sql'.")
+        return {
+            "action": "request_new_query",
+            "description": description.strip(),
+            "suggested_sql": suggested_sql.strip(),
+        }
     if action == "done":
         conclusion = payload.get("conclusion")
         if not isinstance(conclusion, str) or not conclusion.strip():
@@ -533,7 +621,7 @@ def parse_curator_json(raw_content: str) -> dict[str, object]:
     }
 
 
-def validate_select_sql(sql: str) -> None:
+def validate_select_sql_text(sql: str) -> str:
     normalized = " ".join(sql.strip().split())
     upper = normalized.upper()
     if not upper.startswith("SELECT "):
@@ -558,6 +646,33 @@ def validate_select_sql(sql: str) -> None:
     for token in forbidden_tokens:
         if token in padded:
             raise ValueError("Consulta rejeitada por conter comando não permitido.")
+    return normalized
+
+
+def validate_select_sql(sql: str) -> None:
+    validate_select_sql_text(sql)
+
+
+def generate_query_id(description: str, *, existing_ids: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", description.strip().lower()).strip("_")
+    if not base:
+        base = "session_query"
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def print_session_query_candidates(session: OrchestratorSession) -> None:
+    if not session._candidate_queries:
+        return
+    print("\n=== Queries candidatas para o catálogo permanente ===")
+    for query_id, sql in session._candidate_queries:
+        print(f'query_id: "{query_id}"')
+        print(f'sql: "{sql}"')
+    print("Revisar e adicionar manualmente ao QUERY_CATALOG se aprovado.")
 
 
 def print_help() -> None:
@@ -626,12 +741,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             user_text = input("\nvoce> ").strip()
         except (EOFError, KeyboardInterrupt):
+            print_session_query_candidates(session)
             print("\nEncerrando.")
             return 0
 
         if not user_text:
             continue
         if user_text.lower() == "sair":
+            print_session_query_candidates(session)
             return 0
         if user_text.lower() == "ajuda":
             print_help()
@@ -667,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     session.history.append({"role": "assistant", "content": compress_assistant_message(final_text)})
                     print(f"\ncartographer> {final_text}")
+                    print_session_query_candidates(session)
                     return 0
 
                 if action_payload["action"] == "tables":

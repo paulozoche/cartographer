@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sqlite3
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,17 @@ def test_parse_orchestrator_json_accepts_catalog_query_action() -> None:
     assert payload == {"action": "query", "query_id": "knot_type_distribution"}
 
 
+def test_parse_orchestrator_json_accepts_request_new_query_action() -> None:
+    payload = orchestrator.parse_orchestrator_json(
+        '{"action":"request_new_query","description":"contar eventos","suggested_sql":"SELECT 1"}'
+    )
+    assert payload == {
+        "action": "request_new_query",
+        "description": "contar eventos",
+        "suggested_sql": "SELECT 1",
+    }
+
+
 def test_parse_orchestrator_json_rejects_non_json() -> None:
     try:
         orchestrator.parse_orchestrator_json("nao-json")
@@ -39,13 +51,13 @@ def test_query_catalog_contains_known_query() -> None:
     assert "knot_type_distribution" in orchestrator.QUERY_CATALOG
 
 
-def test_parse_orchestrator_json_rejects_unknown_query_id() -> None:
+def test_parse_orchestrator_json_rejects_empty_request_new_query_fields() -> None:
     try:
-        orchestrator.parse_orchestrator_json('{"action":"query","query_id":"nao_existe"}')
+        orchestrator.parse_orchestrator_json('{"action":"request_new_query","description":"","suggested_sql":""}')
     except ValueError as exc:
-        assert "query_id inválido" in str(exc)
+        assert "request_new_query" in str(exc)
     else:  # pragma: no cover
-        raise AssertionError("query_id inválido deveria ser rejeitado.")
+        raise AssertionError("request_new_query inválido deveria ser rejeitado.")
 
 
 def test_build_interface_prompt_includes_first_call_flag() -> None:
@@ -75,6 +87,7 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
         last_error="",
         last_result="",
         executed_queries=[],
+        query_catalog=["knot_type_distribution"],
         attempt_number=1,
     )
     assert '"is_first_call": false' in prompt
@@ -178,6 +191,7 @@ def test_build_orchestrator_prompt_includes_attempt_and_error_context() -> None:
         last_error="Erro operacional: no such table",
         last_result='{"rows":[[1]]}',
         executed_queries=["knot_type_distribution"],
+        query_catalog=["knot_type_distribution"],
         attempt_number=2,
     )
     assert '"attempt_number": 2' in prompt
@@ -209,6 +223,7 @@ def test_orchestrate_system_prompt_forbids_done_on_error() -> None:
         last_error="Erro operacional: x",
         last_result="",
         executed_queries=[],
+        query_catalog=["knot_type_distribution"],
         attempt_number=2,
     )
     assert payload == {"action": "tables"}
@@ -230,6 +245,7 @@ def test_build_orchestrator_prompt_includes_last_result_and_queries() -> None:
         last_error="",
         last_result='{"query_id":"knot_type_distribution","row_count_preview":1}',
         executed_queries=["knot_type_distribution"],
+        query_catalog=["knot_type_distribution"],
         attempt_number=3,
     )
     assert '"user_message": "sim"' in prompt
@@ -247,3 +263,93 @@ def test_run_catalog_query_rejects_unknown_query_id() -> None:
         assert "Query do catálogo não encontrada" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("query_id inexistente deveria falhar.")
+
+
+def test_register_session_query_accepts_valid_sql_and_executes(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE globalid (Country TEXT)")
+        connection.execute("INSERT INTO globalid (Country) VALUES ('PE')")
+        connection.commit()
+
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_type = "sqlite"
+    session.source_path = str(db_path)
+    session._session_query_catalog = {}
+    session._candidate_queries = []
+
+    result = session._register_session_query(
+        description="GlobalID por país",
+        suggested_sql='SELECT "Country", COUNT(*) as total FROM globalid GROUP BY "Country"',
+    )
+
+    assert result["registered_in_session"] is True
+    assert result["row_count_preview"] == 1
+    assert result["query_id"] in session._session_query_catalog
+
+
+def test_register_session_query_rejects_invalid_sql(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE globalid (Country TEXT)")
+        connection.commit()
+
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_type = "sqlite"
+    session.source_path = str(db_path)
+    session._session_query_catalog = {}
+    session._candidate_queries = []
+
+    try:
+        session._register_session_query(
+            description="destrutiva",
+            suggested_sql="DELETE FROM globalid",
+        )
+    except ValueError as exc:
+        assert "SELECT" in str(exc) or "não permitido" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("SQL inválido deveria ser rejeitado.")
+
+
+def test_session_query_becomes_available_in_same_session(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE globalid (Type TEXT)")
+        connection.execute("INSERT INTO globalid (Type) VALUES ('bone')")
+        connection.commit()
+
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_type = "sqlite"
+    session.source_path = str(db_path)
+    session._session_query_catalog = {}
+    session._candidate_queries = []
+
+    result = session._register_session_query(
+        description="tipos globalid",
+        suggested_sql='SELECT "Type", COUNT(*) as total FROM globalid GROUP BY "Type"',
+    )
+    rerun = session._run_catalog_query(result["query_id"])
+    assert rerun["query_id"] == result["query_id"]
+    assert rerun["row_count_preview"] == 1
+
+
+def test_session_query_does_not_modify_fixed_catalog(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE globalid (Country TEXT)")
+        connection.execute("INSERT INTO globalid (Country) VALUES ('PE')")
+        connection.commit()
+
+    original_catalog = dict(orchestrator.QUERY_CATALOG)
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_type = "sqlite"
+    session.source_path = str(db_path)
+    session._session_query_catalog = {}
+    session._candidate_queries = []
+
+    session._register_session_query(
+        description="GlobalID por país",
+        suggested_sql='SELECT "Country", COUNT(*) as total FROM globalid GROUP BY "Country"',
+    )
+
+    assert orchestrator.QUERY_CATALOG == original_catalog
