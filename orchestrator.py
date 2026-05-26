@@ -334,6 +334,8 @@ class OrchestratorSession:
             '  {"action":"schema","table":"nome"}\n'
             '  {"action":"tables"}\n'
             '  {"action":"done","conclusion":"texto"}\n'
+            "Se a mensagem do usuário começar com SELECT, isso é uma query direta.\n"
+            "Nesse caso, responda SEMPRE com request_new_query usando suggested_sql exatamente igual ao SQL digitado pelo usuário.\n"
             "Qualquer outro formato é proibido.\n\n"
             "LEI 2 — CATÁLOGO É EXATO, NÃO APROXIMADO:\n"
             "Só use action=query quando o query_id atender EXATAMENTE ao pedido.\n"
@@ -344,6 +346,7 @@ class OrchestratorSession:
             "Se houver dúvida, use request_new_query.\n\n"
             "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO:\n"
             "Se nenhum query_id do catálogo atender exatamente, SEMPRE emita request_new_query.\n"
+            "Nunca substitua por query do catálogo quando o usuário forneceu SQL explícito.\n"
             "Nunca emita done quando faltar dados para responder.\n"
             "Nunca deixe a Interface inventar dados.\n"
             "No suggested_sql de request_new_query, gere APENAS SELECT simples com condições básicas.\n"
@@ -450,35 +453,11 @@ class OrchestratorSession:
             **getattr(self, "_session_query_catalog", {}),
         }
 
-    def schema_columns_by_unit(self) -> dict[str, set[str]]:
-        schema: dict[str, set[str]] = {}
-        units = getattr(self, "units", None)
-        if units:
-            for unit in units:
-                try:
-                    structure = unit.get_structure()
-                except Exception:
-                    continue
-                schema[unit.unit_name] = {column.name for column in structure.columns}
-            return schema
-
-        if getattr(self, "source_type", "") != "sqlite":
-            return schema
-
-        with sqlite3.connect(self.source_path) as connection:
-            cursor = connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
-            )
-            for (table_name,) in cursor.fetchall():
-                info_cursor = connection.execute(f'PRAGMA table_info("{table_name}")')
-                schema[str(table_name)] = {str(row[1]) for row in info_cursor.fetchall()}
-        return schema
-
     def _register_session_query(self, *, description: str, suggested_sql: str) -> dict[str, object]:
         if self.source_type != "sqlite":
             raise ValueError("Queries novas em sessão estão disponíveis apenas para fontes SQLite neste MVP.")
         validated_sql = validate_select_sql_text(suggested_sql)
-        validate_join_columns_exist(validated_sql, schema_columns=self.schema_columns_by_unit())
+        validate_sql_by_execution(self.source_path, validated_sql)
         preview = self._validate_and_preview_sql(validated_sql)
         query_id = generate_query_id(description, existing_ids=set(self.catalog_for_session().keys()))
         self._session_query_catalog[query_id] = validated_sql
@@ -703,30 +682,13 @@ def validate_select_sql(sql: str) -> None:
     validate_select_sql_text(sql)
 
 
-def validate_join_columns_exist(sql: str, *, schema_columns: dict[str, set[str]]) -> None:
-    alias_to_table: dict[str, str] = {}
-    table_alias_pattern = re.compile(
-        r'\b(?:FROM|JOIN)\s+"?([^"\s]+)"?(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?',
-        flags=re.IGNORECASE,
-    )
-    for table_name, alias in table_alias_pattern.findall(sql):
-        resolved_alias = alias or table_name
-        alias_to_table[resolved_alias] = table_name
-        alias_to_table[table_name] = table_name
-
-    join_condition_pattern = re.compile(
-        r'([A-Za-z_][A-Za-z0-9_]*)\."?([^"\s=]+)"?\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\."?([^"\s=]+)"?',
-        flags=re.IGNORECASE,
-    )
-    for left_alias, left_column, right_alias, right_column in join_condition_pattern.findall(sql):
-        left_table = alias_to_table.get(left_alias)
-        right_table = alias_to_table.get(right_alias)
-        if left_table is None or right_table is None:
-            raise ValueError("JOIN rejeitado: aliases de tabela não foram resolvidos no schema.")
-        if left_column not in schema_columns.get(left_table, set()):
-            raise ValueError(f"JOIN rejeitado: coluna de ligação inexistente {left_table}.{left_column}.")
-        if right_column not in schema_columns.get(right_table, set()):
-            raise ValueError(f"JOIN rejeitado: coluna de ligação inexistente {right_table}.{right_column}.")
+def validate_sql_by_execution(db_path: str, sql: str) -> None:
+    test_sql = f"SELECT * FROM ({sql}) AS __cartographer_validation__ LIMIT 0"
+    try:
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(test_sql)
+    except sqlite3.Error as exc:
+        raise ValueError(f"Query rejeitada pelo SQLite: {exc}") from exc
 
 
 def generate_query_id(description: str, *, existing_ids: set[str]) -> str:

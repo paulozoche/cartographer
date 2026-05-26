@@ -145,19 +145,36 @@ def test_parse_curator_json_rejects_invalid_payload() -> None:
         raise AssertionError("Payload inválido da curadora deveria ser rejeitado.")
 
 
-def test_validate_join_columns_exist_rejects_missing_link_column() -> None:
+def test_validate_sql_by_execution_rejects_invalid_join(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE khipu_main (KHIPU_ID TEXT, REGION TEXT)")
+        connection.execute("CREATE TABLE cord (CORD_ID TEXT, KHIPU_ID TEXT)")
+        connection.commit()
     try:
-        orchestrator.validate_join_columns_exist(
+        orchestrator.validate_sql_by_execution(
+            str(db_path),
             'SELECT * FROM khipu_main km JOIN cord c ON km.ID_INEXISTENTE = c.KHIPU_ID',
-            schema_columns={
-                "khipu_main": {"KHIPU_ID", "REGION"},
-                "cord": {"CORD_ID", "KHIPU_ID"},
-            },
         )
     except ValueError as exc:
-        assert "coluna de ligação inexistente" in str(exc)
+        assert "Query rejeitada pelo SQLite" in str(exc)
     else:  # pragma: no cover
-        raise AssertionError("JOIN com coluna inexistente deveria ser rejeitado.")
+        raise AssertionError("JOIN inválido deveria ser rejeitado.")
+
+
+def test_validate_sql_by_execution_accepts_valid_join(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE khipu_main (KHIPU_ID TEXT, REGION TEXT)")
+        connection.execute("CREATE TABLE cord (CORD_ID TEXT, KHIPU_ID TEXT)")
+        connection.execute("INSERT INTO khipu_main (KHIPU_ID, REGION) VALUES ('K1', 'PE')")
+        connection.execute("INSERT INTO cord (CORD_ID, KHIPU_ID) VALUES ('C1', 'K1')")
+        connection.commit()
+
+    orchestrator.validate_sql_by_execution(
+        str(db_path),
+        "SELECT km.KHIPU_ID FROM khipu_main km JOIN cord c ON km.KHIPU_ID = c.KHIPU_ID",
+    )
 
 
 def test_should_use_curator_only_after_first_call_and_with_more_than_three_units() -> None:
@@ -440,7 +457,7 @@ def test_register_session_query_rejects_invalid_join_columns(tmp_path) -> None:
             ),
         )
     except ValueError as exc:
-        assert "coluna de ligação inexistente" in str(exc)
+        assert "Query rejeitada pelo SQLite" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("JOIN inválido deveria ser rejeitado.")
 
