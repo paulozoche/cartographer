@@ -125,6 +125,7 @@ class OrchestratorSession:
             raise ValueError("Nenhuma unidade tabular foi encontrada na origem informada.")
         self.analysis_by_unit: dict[str, object] = {}
         self.history: list[dict[str, str]] = []
+        self._full_structural_context: str | None = None
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY não encontrada. Verifique o arquivo .env.")
@@ -134,9 +135,11 @@ class OrchestratorSession:
     def bootstrap(self) -> tuple[str, str]:
         analyses = self.analyze_all_units()
         structural_context = self.build_structural_context(analyses)
+        self._full_structural_context = structural_context
         opening = self.interface_reply(
             "Explique o panorama inicial em linguagem humana e sugira o próximo passo de exploração.",
             result_context=structural_context,
+            is_first_call=True,
         )
         return structural_context, opening
 
@@ -162,7 +165,20 @@ class OrchestratorSession:
             sections.extend(summarize_unit_metrics(analysis))
         return "\n\n".join(sections)
 
-    def interface_reply(self, user_text: str, *, result_context: str) -> str:
+    def build_compact_structural_context(self) -> str:
+        lines = [f"Unidades disponíveis: {', '.join(unit.unit_name for unit in self.units)}"]
+        for unit in self.units:
+            row_count = "desconhecida"
+            try:
+                metadata = unit.get_metadata()
+                if metadata.row_count is not None:
+                    row_count = str(metadata.row_count)
+            except Exception:
+                row_count = "desconhecida"
+            lines.append(f"- {unit.unit_name}: {row_count} linhas")
+        return "\n".join(lines)
+
+    def interface_reply(self, user_text: str, *, result_context: str, is_first_call: bool = False) -> str:
         system_prompt = (
             "Você é a IA Interface do Cartographer.\n"
             "Seu papel é conversar com o usuário em português claro.\n"
@@ -176,6 +192,8 @@ class OrchestratorSession:
             history=self.history,
             user_text=user_text,
             result_context=result_context,
+            structural_context=self._full_structural_context if is_first_call else self.build_compact_structural_context(),
+            is_first_call=is_first_call,
         )
         response = self.interface_ai.send(prompt, system_prompt=system_prompt)
         return response.content
@@ -199,6 +217,8 @@ class OrchestratorSession:
             structural_context=structural_context,
             history=self.history,
             user_text=user_text,
+            compact_structural_context=self.build_compact_structural_context(),
+            is_first_call=False,
         )
         response = self.orchestrator_ai.send(prompt, system_prompt=system_prompt)
         return parse_orchestrator_json(response.content)
@@ -290,11 +310,15 @@ def build_interface_prompt(
     history: list[dict[str, str]],
     user_text: str,
     result_context: str,
+    structural_context: str,
+    is_first_call: bool,
 ) -> str:
     payload = {
         "source_path": source_path,
         "source_type": source_type,
         "history": history[-6:],
+        "is_first_call": is_first_call,
+        "structural_context": structural_context,
         "user_message": user_text,
         "available_result": result_context,
     }
@@ -309,14 +333,17 @@ def build_orchestrator_prompt(
     structural_context: str,
     history: list[dict[str, str]],
     user_text: str,
+    compact_structural_context: str,
+    is_first_call: bool,
 ) -> str:
     payload = {
         "source_path": source_path,
         "source_type": source_type,
         "unit_names": unit_names,
         "history": history[-6:],
+        "is_first_call": is_first_call,
         "user_message": user_text,
-        "structural_context": structural_context,
+        "structural_context": structural_context if is_first_call else compact_structural_context,
         "allowed_actions": [
             {"action": "query", "sql": "SELECT ..."},
             {"action": "schema", "table": "nome_da_tabela"},
@@ -398,6 +425,35 @@ def _prompt_source_path(argv: list[str]) -> str:
     return input("Arquivo (CSV, SQLite ou Parquet): ").strip()
 
 
+def compress_assistant_message(text: str, limit: int = 150) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    if limit <= 3:
+        return normalized[:limit]
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def render_tables_message(action_result: str) -> str:
+    payload = json.loads(action_result)
+    tables = payload.get("tables", [])
+    return f"Tabelas disponíveis: {', '.join(str(item) for item in tables) if tables else 'nenhuma'}."
+
+
+def render_schema_message(action_result: str) -> str:
+    payload = json.loads(action_result)
+    table = str(payload.get("table", ""))
+    columns = payload.get("columns", [])
+    rendered = []
+    for column in columns:
+        raw_type = column.get("raw_type")
+        if raw_type:
+            rendered.append(f"{column.get('name')} ({raw_type})")
+        else:
+            rendered.append(str(column.get("name")))
+    return f"Schema de {table}: {', '.join(rendered) if rendered else 'sem colunas visíveis'}."
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv or sys.argv
     source_path = _prompt_source_path(args)
@@ -440,22 +496,34 @@ def main(argv: list[str] | None = None) -> int:
                     "Apresente a conclusão final ao usuário com base no texto da orquestradora.",
                     result_context=execution_result,
                 )
-                session.history.append({"role": "assistant", "content": final_text})
+                session.history.append({"role": "assistant", "content": compress_assistant_message(final_text)})
                 print(f"\ncartographer> {final_text}")
                 return 0
+
+            if action_payload["action"] == "tables":
+                reply = render_tables_message(execution_result)
+                session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
+                print(f"\ncartographer> {reply}")
+                continue
+
+            if action_payload["action"] == "schema":
+                reply = render_schema_message(execution_result)
+                session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
+                print(f"\ncartographer> {reply}")
+                continue
 
             reply = session.interface_reply(
                 "Explique este resultado ao usuário, responda à pergunta atual e sugira o próximo passo.",
                 result_context=execution_result,
             )
-            session.history.append({"role": "assistant", "content": reply})
+            session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
             print(f"\ncartographer> {reply}")
         except Exception as exc:
             error_reply = session.interface_reply(
                 "Explique o erro de forma útil e oriente o usuário sobre como continuar.",
                 result_context=f"Erro operacional: {exc}",
             )
-            session.history.append({"role": "assistant", "content": error_reply})
+            session.history.append({"role": "assistant", "content": compress_assistant_message(error_reply)})
             print(f"\ncartographer> {error_reply}")
 
 
