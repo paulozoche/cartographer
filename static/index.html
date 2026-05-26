@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cartographer Web</title>
+    <style>
+      :root {
+        --bg: #09111c;
+        --panel: #0f1b2d;
+        --panel-2: #14243a;
+        --text: #d9e7ff;
+        --muted: #90a4c2;
+        --accent: #4dd6a7;
+        --accent-2: #67b7ff;
+        --border: #22344f;
+        --danger: #ff7c7c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top, rgba(103,183,255,0.12), transparent 32%),
+          linear-gradient(180deg, #09111c 0%, #07101a 100%);
+        color: var(--text);
+        font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .shell {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .hero, .panel {
+        background: rgba(15, 27, 45, 0.9);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+      }
+      .hero {
+        padding: 24px;
+        margin-bottom: 18px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+      }
+      .lede {
+        margin: 0;
+        color: var(--muted);
+      }
+      .upload-bar {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-top: 18px;
+      }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        min-height: 68vh;
+        overflow: hidden;
+      }
+      .status {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        color: var(--muted);
+        background: rgba(20, 36, 58, 0.8);
+      }
+      .chat-log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      .exchange {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(103, 183, 255, 0.12);
+      }
+      .message {
+        max-width: 86%;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        white-space: pre-wrap;
+        position: relative;
+      }
+      .message-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+      .message-label {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+      }
+      .message-copy {
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.04);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        line-height: 1;
+      }
+      .message-copy.copied {
+        background: rgba(77, 214, 167, 0.2);
+        color: var(--accent);
+      }
+      .message.user {
+        align-self: flex-end;
+        background: rgba(103, 183, 255, 0.12);
+      }
+      .message.bot {
+        align-self: flex-start;
+        background: rgba(77, 214, 167, 0.08);
+      }
+      .message.system {
+        align-self: center;
+        background: rgba(255,255,255,0.04);
+        color: var(--muted);
+      }
+      .message.user .message-label {
+        color: var(--accent-2);
+      }
+      .message.bot .message-label {
+        color: var(--accent);
+      }
+      .message.system .message-label {
+        color: var(--muted);
+      }
+      .message-body > *:last-child {
+        margin-bottom: 0;
+      }
+      .composer {
+        padding: 16px;
+        border-top: 1px solid var(--border);
+        background: rgba(9, 17, 28, 0.75);
+      }
+      .composer form {
+        display: flex;
+        gap: 12px;
+      }
+      input[type="file"],
+      input[type="text"] {
+        background: #08111d;
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+      input[type="file"] {
+        padding: 10px;
+      }
+      input[type="text"] {
+        flex: 1;
+        padding: 14px 16px;
+      }
+      button {
+        border: 0;
+        border-radius: 12px;
+        padding: 12px 18px;
+        font: inherit;
+        color: #08111d;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        cursor: pointer;
+        font-weight: 700;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: wait;
+      }
+      .error {
+        color: var(--danger);
+      }
+      .message.bot h1, .message.bot h2, .message.bot h3,
+      .message.bot p, .message.bot ul, .message.bot ol {
+        margin-top: 0;
+      }
+      code {
+        background: rgba(255,255,255,0.07);
+        padding: 0.1rem 0.35rem;
+        border-radius: 6px;
+      }
+      @media (max-width: 800px) {
+        .shell { padding: 14px; }
+        .message { max-width: 100%; }
+        .composer form, .upload-bar { flex-direction: column; align-items: stretch; }
+        button { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <h1>Cartographer Web</h1>
+        <p class="lede">Upload do arquivo no topo, conversa abaixo. A lógica continua no mesmo orquestrador do terminal.</p>
+        <div class="upload-bar">
+          <input id="fileInput" type="file" accept=".csv,.parquet,.db,.sqlite,.sqlite3" />
+          <button id="uploadButton" type="button">Enviar arquivo</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div id="status" class="status">Nenhum arquivo carregado.</div>
+        <div id="chatLog" class="chat-log">
+          <div class="message system">Faça upload de um arquivo SQLite, CSV ou Parquet para iniciar a sessão.</div>
+        </div>
+        <div class="composer">
+          <form id="chatForm">
+            <input id="messageInput" type="text" placeholder="Digite sua pergunta..." autocomplete="off" disabled />
+            <button id="sendButton" type="submit" disabled>Enviar</button>
+          </form>
+        </div>
+      </section>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+      const statusEl = document.getElementById("status");
+      const chatLog = document.getElementById("chatLog");
+      const uploadButton = document.getElementById("uploadButton");
+      const fileInput = document.getElementById("fileInput");
+      const chatForm = document.getElementById("chatForm");
+      const messageInput = document.getElementById("messageInput");
+      const sendButton = document.getElementById("sendButton");
+
+      let sessionId = "";
+
+      function setBusy(isBusy, label) {
+        uploadButton.disabled = isBusy;
+        sendButton.disabled = isBusy || !sessionId;
+        messageInput.disabled = isBusy || !sessionId;
+        statusEl.textContent = label;
+      }
+
+      function appendMessage(role, text) {
+        const lastExchange = chatLog.lastElementChild;
+        let exchange = lastExchange && lastExchange.classList.contains("exchange") ? lastExchange : null;
+        if (!exchange || role === "user" || role === "system") {
+          exchange = document.createElement("div");
+          exchange.className = "exchange";
+          chatLog.appendChild(exchange);
+        }
+
+        const node = document.createElement("div");
+        node.className = `message ${role}`;
+        const label = role === "user" ? "Você" : role === "bot" ? "Cartographer" : "Sistema";
+        const header = document.createElement("div");
+        header.className = "message-header";
+
+        const labelEl = document.createElement("div");
+        labelEl.className = "message-label";
+        labelEl.textContent = label;
+
+        const copyButton = document.createElement("button");
+        copyButton.type = "button";
+        copyButton.className = "message-copy";
+        copyButton.textContent = "Copiar";
+        copyButton.addEventListener("click", async () => {
+          await navigator.clipboard.writeText(text);
+          copyButton.textContent = "Copiado";
+          copyButton.classList.add("copied");
+          setTimeout(() => {
+            copyButton.textContent = "Copiar";
+            copyButton.classList.remove("copied");
+          }, 1200);
+        });
+
+        header.appendChild(labelEl);
+        header.appendChild(copyButton);
+
+        const body = document.createElement("div");
+        body.className = "message-body";
+        if (role === "bot") {
+          body.innerHTML = marked.parse(text);
+        } else {
+          body.textContent = text;
+        }
+
+        node.appendChild(header);
+        node.appendChild(body);
+        exchange.appendChild(node);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      async function uploadFile() {
+        const file = fileInput.files[0];
+        if (!file) {
+          appendMessage("system", "Escolha um arquivo antes do upload.");
+          return;
+        }
+        const form = new FormData();
+        form.append("file", file);
+        setBusy(true, "Enviando arquivo...");
+        try {
+          const response = await fetch("/upload", { method: "POST", body: form });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.detail || "Falha no upload.");
+          }
+          sessionId = payload.session_id;
+          chatLog.innerHTML = "";
+          appendMessage("system", `Sessão iniciada: ${sessionId}`);
+          appendMessage("bot", payload.response);
+          setBusy(false, `Arquivo carregado. Sessão ${sessionId}.`);
+        } catch (error) {
+          appendMessage("system", `Erro no upload: ${error.message}`);
+          setBusy(false, "Falha no upload.");
+        }
+      }
+
+      async function sendMessage(event) {
+        event.preventDefault();
+        const message = messageInput.value.trim();
+        if (!message || !sessionId) return;
+        appendMessage("user", message);
+        messageInput.value = "";
+        setBusy(true, "Processando mensagem...");
+        try {
+          const response = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, message })
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.detail || "Falha no chat.");
+          }
+          appendMessage("bot", payload.response);
+          setBusy(false, `Sessão ativa: ${sessionId}`);
+        } catch (error) {
+          appendMessage("system", `Erro no chat: ${error.message}`);
+          setBusy(false, "Falha no chat.");
+        }
+      }
+
+      uploadButton.addEventListener("click", uploadFile);
+      chatForm.addEventListener("submit", sendMessage);
+    </script>
+  </body>
+</html>
