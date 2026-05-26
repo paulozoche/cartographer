@@ -85,45 +85,48 @@ QUERY_CATALOG = {
         SELECT "Type", COUNT(*) as total
         FROM globalid GROUP BY "Type" ORDER BY total DESC
     """,
-    "knot_type_by_region_clean": """
-        SELECT km.REGION, k.TYPE_CODE, COUNT(*) as total
-        FROM knot k JOIN cord c ON k.CORD_ID = c.CORD_ID
-        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
-        WHERE km.REGION IS NOT NULL AND km.REGION != '' AND km.REGION != ' '
-        AND k.TYPE_CODE IS NOT NULL AND k.TYPE_CODE != ''
-        GROUP BY km.REGION, k.TYPE_CODE ORDER BY km.REGION, total DESC
+}
+ANALYTIC_TEMPLATES = {
+    "group_feature_signature": """
+        SELECT
+            {group_expr} AS group_value,
+            {feature_expr} AS feature_value,
+            {subfeature_expr}
+            COUNT(*) AS total,
+            ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY {group_expr}), 2) AS pct_group
+        FROM {from_clause}
+        WHERE {where_clause}
+        GROUP BY {group_expr}, {feature_expr}{subfeature_group}
+        ORDER BY group_value, pct_group DESC
     """,
-    "knot_signature_by_region": """
-        SELECT km.REGION, k.TYPE_CODE, k.DIRECTION, COUNT(*) AS total
-        FROM knot k JOIN cord c ON k.CORD_ID = c.CORD_ID
-        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
-        WHERE km.REGION IS NOT NULL AND km.REGION != '' AND km.REGION != ' '
-        GROUP BY km.REGION, k.TYPE_CODE, k.DIRECTION ORDER BY km.REGION, total DESC
+    "group_feature_signature_by_entity": """
+        SELECT
+            {group_expr} AS group_value,
+            {entity_expr} AS entity_id,
+            {feature_expr} AS feature_value,
+            {subfeature_expr}
+            COUNT(*) AS total
+        FROM {from_clause}
+        WHERE {where_clause}
+        GROUP BY {group_expr}, {entity_expr}, {feature_expr}{subfeature_group}
+        ORDER BY group_value, entity_id, total DESC
     """,
-    "knot_signature_normalized": """
-        SELECT km.REGION, k.TYPE_CODE, k.DIRECTION,
-               COUNT(*) AS total,
-               ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY km.REGION), 2) AS pct_region
-        FROM knot k
-        JOIN cord c ON k.CORD_ID = c.CORD_ID
-        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
-        WHERE km.REGION IS NOT NULL AND TRIM(km.REGION) != ''
-        AND k.TYPE_CODE IS NOT NULL AND TRIM(k.TYPE_CODE) != '' AND TRIM(k.TYPE_CODE) != "''"
-        AND k.DIRECTION IS NOT NULL AND TRIM(k.DIRECTION) != ''
-        GROUP BY km.REGION, k.TYPE_CODE, k.DIRECTION
-        ORDER BY km.REGION, pct_region DESC
-    """,
-    "knot_signature_by_khipu": """
-        SELECT km.REGION, km.PROVENANCE, km.KHIPU_ID, k.TYPE_CODE, k.DIRECTION,
-               COUNT(*) AS total
-        FROM knot k
-        JOIN cord c ON k.CORD_ID = c.CORD_ID
-        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
-        WHERE km.REGION IS NOT NULL AND TRIM(km.REGION) != ''
-        AND k.TYPE_CODE IS NOT NULL AND TRIM(k.TYPE_CODE) != ''
-        AND k.DIRECTION IS NOT NULL AND TRIM(k.DIRECTION) != ''
-        GROUP BY km.REGION, km.PROVENANCE, km.KHIPU_ID, k.TYPE_CODE, k.DIRECTION
-        ORDER BY km.REGION, km.PROVENANCE, km.KHIPU_ID, total DESC
+    "exclusive_feature_values_by_group": """
+        WITH clean AS (
+            SELECT {group_expr} AS group_value, {feature_expr} AS feature_value, COUNT(*) AS total
+            FROM {from_clause}
+            WHERE {where_clause}
+            GROUP BY {group_expr}, {feature_expr}
+        ),
+        group_count AS (
+            SELECT feature_value, COUNT(DISTINCT group_value) AS groups_with_feature
+            FROM clean GROUP BY feature_value
+        )
+        SELECT clean.group_value, clean.feature_value, clean.total
+        FROM clean
+        JOIN group_count gc ON clean.feature_value = gc.feature_value
+        WHERE gc.groups_with_feature = 1
+        ORDER BY clean.total DESC
     """,
 }
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -339,6 +342,23 @@ class OrchestratorSession:
             "Você nunca promete executar algo e nunca usa frases como 'vou executar agora', 'vou investigar' ou 'precisamos executar'.\n"
             "Se um resultado não estiver disponível no contexto, diga apenas 'não tenho esse dado, aguarde a execução'.\n"
             'Se o resultado contiver "truncated: true", você DEVE avisar o usuário que o resultado está incompleto e NÃO pode concluir sobre padrões, exclusividade ou predominância. Diga apenas: "resultado parcial — não é possível concluir ainda".\n'
+            "Para concluir sobre exclusividade, predominância global, ausência ou padrão regional, a query usada deve ser uma query agregada completa.\n"
+            "Nunca concluir sobre esses temas a partir de consulta por entidade individual com resultado truncado.\n"
+            'Se o resultado vier de uma query por entidade individual e estiver truncado, diga: "resultado parcial — use uma query agregada para conclusões regionais".\n'
+            "REGRAS DE LINGUAGEM PARA CONCLUSÕES:\n"
+            'Use "assinatura forte" SOMENTE quando:\n'
+            "- resultado não truncado\n"
+            "- padrão aparece em mais de uma entidade\n"
+            "- proporção regional alta\n"
+            "- exclusividade confirmada por consulta agregada de exclusividade\n"
+            'Use "hipótese" quando:\n'
+            "- poucas entidades na amostra\n"
+            "- resultado truncado\n"
+            "- exclusividade não confirmada\n"
+            'Use "pista" quando:\n'
+            "- amostra pequena (menos de 3 entidades)\n"
+            "- resultado parcial\n"
+            'Nunca use "descoberta", "exclusivo" ou "predominante" sem validação completa.\n'
         )
         prompt = build_interface_prompt(
             source_path=self.source_path,
@@ -371,6 +391,7 @@ class OrchestratorSession:
             "LEI 1 — FORMATO ABSOLUTO:\n"
             "Toda resposta deve ser exatamente um destes JSONs:\n"
             '  {"action":"query","query_id":"id_do_catalogo"}\n'
+            '  {"action":"template","template_id":"group_feature_signature","params":{"group_expr":"...","feature_expr":"...","from_clause":"...","where_clause":"...","subfeature_expr":"","subfeature_group":""}}\n'
             '  {"action":"request_new_query","description":"o que precisa","suggested_sql":"SELECT ..."}\n'
             '  {"action":"schema","table":"nome"}\n'
             '  {"action":"tables"}\n'
@@ -402,6 +423,14 @@ class OrchestratorSession:
             "LEI 6 — NÃO REEXECUTE:\n"
             "Se já existe resultado válido no turno atual, não reexecute o mesmo query_id.\n"
             "Use o resultado existente para decidir o próximo passo.\n"
+            "Quando o usuário pedir padrões, assinaturas ou diferenças por grupo:\n"
+            "- Use action=template com template_id=group_feature_signature\n"
+            "- Identifique: grupo, atributo, joins necessários, filtros de limpeza\n"
+            "Quando o usuário pedir exclusividade ou ausência:\n"
+            "- Use action=template com template_id=exclusive_feature_values_by_group\n"
+            "- Nunca deduza exclusividade de preview ou amostra parcial\n"
+            "Para validar se padrão vem de múltiplos objetos:\n"
+            "- Use action=template com template_id=group_feature_signature_by_entity\n"
         )
         prompt = build_orchestrator_prompt(
             source_path=self.source_path,
@@ -438,6 +467,13 @@ class OrchestratorSession:
         if action == "query":
             query_id = str(action_payload["query_id"])
             return json.dumps(self._run_catalog_query(query_id), ensure_ascii=False, indent=2, default=str)
+        if action == "template":
+            template_id = str(action_payload["template_id"])
+            params = dict(action_payload["params"])
+            sql = build_sql_from_template(template_id, params)
+            validate_select_sql_text(sql)
+            validate_sql_by_execution(self.source_path, sql)
+            return json.dumps(self._validate_and_preview_sql(sql) | {"template_id": template_id, "sql": sql}, ensure_ascii=False, indent=2, default=str)
         if action == "request_new_query":
             description = str(action_payload["description"])
             suggested_sql = str(action_payload["suggested_sql"])
@@ -606,8 +642,21 @@ def build_orchestrator_prompt(
         "last_result": last_result or "",
         "executed_queries": executed_queries or [],
         "query_catalog": query_catalog or sorted(set(QUERY_CATALOG.keys())),
+        "analytic_templates": sorted(ANALYTIC_TEMPLATES.keys()),
         "allowed_actions": [
             {"action": "query", "query_id": "knot_type_distribution"},
+            {
+                "action": "template",
+                "template_id": "group_feature_signature",
+                "params": {
+                    "group_expr": "...",
+                    "feature_expr": "...",
+                    "from_clause": "...",
+                    "where_clause": "...",
+                    "subfeature_expr": "",
+                    "subfeature_group": "",
+                },
+            },
             {"action": "request_new_query", "description": "descricao", "suggested_sql": "SELECT ..."},
             {"action": "schema", "table": "nome_da_tabela"},
             {"action": "tables"},
@@ -652,6 +701,17 @@ def parse_orchestrator_json(raw_content: str) -> dict[str, object]:
             raise ValueError("Ação query exige o campo 'query_id'.")
         normalized = query_id.strip()
         return {"action": "query", "query_id": normalized}
+    if action == "template":
+        template_id = payload.get("template_id")
+        params = payload.get("params")
+        if not isinstance(template_id, str) or not template_id.strip():
+            raise ValueError("Ação template exige o campo 'template_id'.")
+        if template_id.strip() not in ANALYTIC_TEMPLATES:
+            raise ValueError(f"Template não encontrado: {template_id.strip()}")
+        if not isinstance(params, dict):
+            raise ValueError("Ação template exige o campo 'params' como objeto.")
+        normalized_params = {str(key): str(value) for key, value in params.items()}
+        return {"action": "template", "template_id": template_id.strip(), "params": normalized_params}
     if action == "request_new_query":
         description = payload.get("description")
         suggested_sql = payload.get("suggested_sql")
@@ -721,6 +781,13 @@ def validate_select_sql_text(sql: str) -> str:
 
 def validate_select_sql(sql: str) -> None:
     validate_select_sql_text(sql)
+
+
+def build_sql_from_template(template_id: str, params: dict[str, str]) -> str:
+    template = ANALYTIC_TEMPLATES.get(template_id)
+    if not template:
+        raise ValueError(f"Template não encontrado: {template_id}")
+    return template.format(**params)
 
 
 def validate_sql_by_execution(db_path: str, sql: str) -> None:

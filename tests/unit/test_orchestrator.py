@@ -27,6 +27,24 @@ def test_parse_orchestrator_json_accepts_catalog_query_action() -> None:
     assert payload == {"action": "query", "query_id": "knot_type_distribution"}
 
 
+def test_parse_orchestrator_json_accepts_template_action() -> None:
+    payload = orchestrator.parse_orchestrator_json(
+        '{"action":"template","template_id":"group_feature_signature","params":{"group_expr":"region","feature_expr":"type_code","from_clause":"t","where_clause":"1=1","subfeature_expr":"","subfeature_group":""}}'
+    )
+    assert payload == {
+        "action": "template",
+        "template_id": "group_feature_signature",
+        "params": {
+            "group_expr": "region",
+            "feature_expr": "type_code",
+            "from_clause": "t",
+            "where_clause": "1=1",
+            "subfeature_expr": "",
+            "subfeature_group": "",
+        },
+    }
+
+
 def test_parse_orchestrator_json_accepts_request_new_query_action() -> None:
     payload = orchestrator.parse_orchestrator_json(
         '{"action":"request_new_query","description":"contar eventos","suggested_sql":"SELECT 1"}'
@@ -49,6 +67,14 @@ def test_parse_orchestrator_json_rejects_non_json() -> None:
 
 def test_query_catalog_contains_known_query() -> None:
     assert "knot_type_distribution" in orchestrator.QUERY_CATALOG
+
+
+def test_analytic_templates_contains_expected_templates() -> None:
+    assert set(orchestrator.ANALYTIC_TEMPLATES) == {
+        "group_feature_signature",
+        "group_feature_signature_by_entity",
+        "exclusive_feature_values_by_group",
+    }
 
 
 def test_parse_orchestrator_json_rejects_empty_request_new_query_fields() -> None:
@@ -94,6 +120,7 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
     assert '"structural_context": "events: 10 linhas"' in prompt
     assert "contexto completo" not in prompt
     assert '"query_catalog": [' in prompt
+    assert '"analytic_templates": [' in prompt
 
 
 def test_compress_assistant_message_limits_size() -> None:
@@ -337,6 +364,54 @@ def test_build_orchestrator_prompt_includes_last_result_and_queries() -> None:
     assert '"user_message": "sim"' in prompt
     assert 'knot_type_distribution' in prompt
     assert '"last_result": "{\\"query_id\\":\\"knot_type_distribution\\",\\"row_count_preview\\":1}"' in prompt
+
+
+def test_build_sql_from_template_group_feature_signature() -> None:
+    sql = orchestrator.build_sql_from_template(
+        "group_feature_signature",
+        {
+            "group_expr": "region",
+            "feature_expr": "type_code",
+            "from_clause": "sample_table",
+            "where_clause": "1=1",
+            "subfeature_expr": "",
+            "subfeature_group": "",
+        },
+    )
+    assert "SELECT" in sql
+    assert "FROM sample_table" in sql
+    assert "GROUP BY region, type_code" in sql
+
+
+def test_build_sql_from_template_group_feature_signature_by_entity() -> None:
+    sql = orchestrator.build_sql_from_template(
+        "group_feature_signature_by_entity",
+        {
+            "group_expr": "region",
+            "entity_expr": "entity_id",
+            "feature_expr": "type_code",
+            "from_clause": "sample_table",
+            "where_clause": "1=1",
+            "subfeature_expr": "",
+            "subfeature_group": "",
+        },
+    )
+    assert "entity_id AS entity_id" in sql
+    assert "GROUP BY region, entity_id, type_code" in sql
+
+
+def test_build_sql_from_template_exclusive_feature_values_by_group() -> None:
+    sql = orchestrator.build_sql_from_template(
+        "exclusive_feature_values_by_group",
+        {
+            "group_expr": "region",
+            "feature_expr": "type_code",
+            "from_clause": "sample_table",
+            "where_clause": "1=1",
+        },
+    )
+    assert "WITH clean AS" in sql
+    assert "COUNT(DISTINCT group_value)" in sql
 
 
 def test_run_catalog_query_rejects_unknown_query_id() -> None:
