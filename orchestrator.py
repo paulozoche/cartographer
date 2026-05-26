@@ -28,10 +28,51 @@ SUPPORTED_SUFFIXES = {
     ".sqlite": "sqlite",
     ".sqlite3": "sqlite",
 }
+QUERY_CATALOG = {
+    "knot_type_distribution": """
+        SELECT TYPE_CODE, COUNT(*) as total,
+               ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+        FROM knot GROUP BY TYPE_CODE ORDER BY total DESC
+    """,
+    "avg_cords_per_khipu": """
+        SELECT ROUND(AVG(cord_count), 2) as avg_cords
+        FROM (SELECT KHIPU_ID, COUNT(*) as cord_count FROM cord GROUP BY KHIPU_ID)
+    """,
+    "knot_direction_by_type": """
+        SELECT k.TYPE_CODE, k.DIRECTION, COUNT(*) as total
+        FROM knot k GROUP BY k.TYPE_CODE, k.DIRECTION ORDER BY total DESC
+    """,
+    "khipu_by_region": """
+        SELECT km.REGION, COUNT(*) as total
+        FROM khipu_main km GROUP BY km.REGION ORDER BY total DESC
+    """,
+    "top_complex_khipus": """
+        SELECT km.KHIPU_ID, km.PROVENANCE, km.REGION, COUNT(c.CORD_ID) as total_cords
+        FROM khipu_main km JOIN cord c ON km.KHIPU_ID = c.KHIPU_ID
+        GROUP BY km.KHIPU_ID ORDER BY total_cords DESC LIMIT 10
+    """,
+    "knot_position_vs_direction": """
+        SELECT KNOT_POS, DIRECTION, COUNT(*) as total
+        FROM knot GROUP BY KNOT_POS, DIRECTION ORDER BY KNOT_POS, total DESC
+    """,
+    "cord_colors_distribution": """
+        SELECT AS_COLOR_CD, COUNT(*) as total
+        FROM ascher_cord_color GROUP BY AS_COLOR_CD ORDER BY total DESC LIMIT 20
+    """,
+    "datacao_valida": """
+        SELECT KHIPU_ID, EARLIEST_AGE, LATEST_AGE, REGION, PROVENANCE
+        FROM khipu_main
+        WHERE EARLIEST_AGE != '0000-00-00' AND EARLIEST_AGE IS NOT NULL
+        ORDER BY EARLIEST_AGE
+    """,
+}
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_TIMEOUT_SECONDS = 30.0
+CURATOR_TIMEOUT_SECONDS = 15.0
+MAX_ATTEMPTS_PER_TURN = 3
 INTERFACE_MODEL = "deepseek-chat"
 ORCHESTRATOR_MODEL = "deepseek-chat"
+CURATOR_MODEL = "deepseek-chat"
 
 
 class DeepSeekAPIError(RuntimeError):
@@ -126,11 +167,17 @@ class OrchestratorSession:
         self.analysis_by_unit: dict[str, object] = {}
         self.history: list[dict[str, str]] = []
         self._full_structural_context: str | None = None
+        self._curator_cache: dict[str, dict[str, object]] = {}
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY não encontrada. Verifique o arquivo .env.")
         self.interface_ai = DeepSeekClient(api_key=api_key, model=INTERFACE_MODEL)
         self.orchestrator_ai = DeepSeekClient(api_key=api_key, model=ORCHESTRATOR_MODEL)
+        self.curator_ai = DeepSeekClient(
+            api_key=api_key,
+            model=CURATOR_MODEL,
+            timeout_seconds=CURATOR_TIMEOUT_SECONDS,
+        )
 
     def bootstrap(self) -> tuple[str, str]:
         analyses = self.analyze_all_units()
@@ -178,6 +225,43 @@ class OrchestratorSession:
             lines.append(f"- {unit.unit_name}: {row_count} linhas")
         return "\n".join(lines)
 
+    def should_use_curator(self, *, is_first_call: bool) -> bool:
+        return not is_first_call and len(self.units) > 3 and bool(self._full_structural_context)
+
+    def curated_context_for(self, user_text: str, *, is_first_call: bool) -> str:
+        if not self.should_use_curator(is_first_call=is_first_call):
+            return self._full_structural_context or self.build_compact_structural_context()
+        cache_key = user_text.strip()
+        cached = self._curator_cache.get(cache_key)
+        if cached is not None:
+            curated_context = cached.get("curated_context")
+            if isinstance(curated_context, str) and curated_context.strip():
+                return curated_context
+            return self._full_structural_context or self.build_compact_structural_context()
+
+        system_prompt = (
+            "Você é a IA Curadora do Cartographer.\n"
+            "Você nunca conversa, nunca executa ações e nunca cria interpretações.\n"
+            "Responda somente com JSON válido no formato esperado.\n"
+            "Seu trabalho é filtrar o contexto estrutural existente para o subconjunto relevante à pergunta atual.\n"
+        )
+        prompt = build_curator_prompt(
+            user_message=user_text,
+            available_units=[unit.unit_name for unit in self.units],
+            full_context=self._full_structural_context or "",
+        )
+        try:
+            response = self.curator_ai.send(prompt, system_prompt=system_prompt)
+            payload = parse_curator_json(response.content)
+        except Exception:
+            return self._full_structural_context or self.build_compact_structural_context()
+
+        self._curator_cache[cache_key] = payload
+        curated_context = payload.get("curated_context")
+        if isinstance(curated_context, str) and curated_context.strip():
+            return curated_context
+        return self._full_structural_context or self.build_compact_structural_context()
+
     def interface_reply(self, user_text: str, *, result_context: str, is_first_call: bool = False) -> str:
         system_prompt = (
             "Você é a IA Interface do Cartographer.\n"
@@ -192,23 +276,38 @@ class OrchestratorSession:
             history=self.history,
             user_text=user_text,
             result_context=result_context,
-            structural_context=self._full_structural_context if is_first_call else self.build_compact_structural_context(),
+            structural_context=self._full_structural_context if is_first_call else self.curated_context_for(user_text, is_first_call=is_first_call),
             is_first_call=is_first_call,
         )
         response = self.interface_ai.send(prompt, system_prompt=system_prompt)
         return response.content
 
-    def orchestrate(self, user_text: str, structural_context: str) -> dict[str, object]:
+    def orchestrate(
+        self,
+        user_text: str,
+        structural_context: str,
+        *,
+        last_error: str | None = None,
+        last_result: str | None = None,
+        executed_queries: list[str] | None = None,
+        attempt_number: int = 1,
+    ) -> dict[str, object]:
         system_prompt = (
             "Você é a IA Orquestradora do Cartographer.\n"
             "Responda somente com JSON válido, sem markdown e sem texto extra.\n"
             "A saída deve seguir exatamente um destes contratos:\n"
-            '{"action":"query","sql":"SELECT ..."}\n'
+            '{"action":"query","query_id":"knot_type_distribution"}\n'
             '{"action":"schema","table":"nome_da_tabela"}\n'
             '{"action":"tables"}\n'
             '{"action":"done","conclusion":"texto"}\n'
             "Nunca converse com o usuário.\n"
-            "Nunca produza SQL que não seja SELECT.\n"
+            "Nunca gere SQL livremente.\n"
+            "Para action=query, escolha apenas um query_id existente no catálogo disponível.\n"
+            "Nunca emita 'done' quando o resultado ou contexto de erro contiver 'erro' ou 'error'.\n"
+            "Em caso de erro de consulta, tente outro query_id do catálogo apenas se ele responder melhor à pergunta.\n"
+            "Nunca emita 'done' quando a mensagem do usuário for apenas uma confirmação curta como 'sim', 'ok', 'continue' ou 'prossiga'.\n"
+            "Se já existir resultado válido no turno atual, use esse resultado para decidir a próxima ação e não reexecute o mesmo query_id.\n"
+            "Só emita 'done' quando houver uma conclusão real e bem-sucedida.\n"
         )
         prompt = build_orchestrator_prompt(
             source_path=self.source_path,
@@ -217,8 +316,12 @@ class OrchestratorSession:
             structural_context=structural_context,
             history=self.history,
             user_text=user_text,
-            compact_structural_context=self.build_compact_structural_context(),
+            compact_structural_context=self.curated_context_for(user_text, is_first_call=False),
             is_first_call=False,
+            last_error=last_error,
+            last_result=last_result,
+            executed_queries=executed_queries or [],
+            attempt_number=attempt_number,
         )
         response = self.orchestrator_ai.send(prompt, system_prompt=system_prompt)
         return parse_orchestrator_json(response.content)
@@ -238,9 +341,8 @@ class OrchestratorSession:
             table = str(action_payload["table"])
             return json.dumps(self._schema_for_table(table), ensure_ascii=False, indent=2)
         if action == "query":
-            sql = str(action_payload["sql"])
-            validate_select_sql(sql)
-            return json.dumps(self._run_select(sql), ensure_ascii=False, indent=2, default=str)
+            query_id = str(action_payload["query_id"])
+            return json.dumps(self._run_catalog_query(query_id), ensure_ascii=False, indent=2, default=str)
         if action == "done":
             return str(action_payload["conclusion"])
         raise ValueError(f"Ação não suportada: {action}")
@@ -263,14 +365,18 @@ class OrchestratorSession:
             ],
         }
 
-    def _run_select(self, sql: str) -> dict[str, object]:
+    def _run_catalog_query(self, query_id: str) -> dict[str, object]:
         if self.source_type != "sqlite":
             raise ValueError("Ação query está disponível apenas para fontes SQLite neste MVP.")
+        sql = QUERY_CATALOG.get(query_id)
+        if sql is None:
+            raise ValueError(f"Query do catálogo não encontrada: {query_id}")
         with sqlite3.connect(self.source_path) as connection:
             cursor = connection.execute(sql)
             column_names = [item[0] for item in cursor.description or ()]
             rows = cursor.fetchmany(50)
         return {
+            "query_id": query_id,
             "sql": sql,
             "columns": column_names,
             "rows": rows,
@@ -335,6 +441,10 @@ def build_orchestrator_prompt(
     user_text: str,
     compact_structural_context: str,
     is_first_call: bool,
+    last_error: str | None = None,
+    last_result: str | None = None,
+    executed_queries: list[str] | None = None,
+    attempt_number: int = 1,
 ) -> str:
     payload = {
         "source_path": source_path,
@@ -342,14 +452,33 @@ def build_orchestrator_prompt(
         "unit_names": unit_names,
         "history": history[-6:],
         "is_first_call": is_first_call,
+        "attempt_number": attempt_number,
         "user_message": user_text,
         "structural_context": structural_context if is_first_call else compact_structural_context,
+        "last_error": last_error or "",
+        "last_result": last_result or "",
+        "executed_queries": executed_queries or [],
+        "query_catalog": sorted(QUERY_CATALOG.keys()),
         "allowed_actions": [
-            {"action": "query", "sql": "SELECT ..."},
+            {"action": "query", "query_id": "knot_type_distribution"},
             {"action": "schema", "table": "nome_da_tabela"},
             {"action": "tables"},
             {"action": "done", "conclusion": "texto da conclusão"},
         ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_curator_prompt(
+    *,
+    user_message: str,
+    available_units: list[str],
+    full_context: str,
+) -> str:
+    payload = {
+        "user_message": user_message,
+        "available_units": available_units,
+        "full_context": full_context,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -370,17 +499,38 @@ def parse_orchestrator_json(raw_content: str) -> dict[str, object]:
             raise ValueError("Ação schema exige o campo 'table'.")
         return {"action": "schema", "table": table.strip()}
     if action == "query":
-        sql = payload.get("sql")
-        if not isinstance(sql, str) or not sql.strip():
-            raise ValueError("Ação query exige o campo 'sql'.")
-        validate_select_sql(sql)
-        return {"action": "query", "sql": sql.strip()}
+        query_id = payload.get("query_id")
+        if not isinstance(query_id, str) or not query_id.strip():
+            raise ValueError("Ação query exige o campo 'query_id'.")
+        normalized = query_id.strip()
+        if normalized not in QUERY_CATALOG:
+            raise ValueError(f"query_id inválido: {normalized}")
+        return {"action": "query", "query_id": normalized}
     if action == "done":
         conclusion = payload.get("conclusion")
         if not isinstance(conclusion, str) or not conclusion.strip():
             raise ValueError("Ação done exige o campo 'conclusion'.")
         return {"action": "done", "conclusion": conclusion.strip()}
     raise ValueError(f"Ação inválida da orquestradora: {action!r}")
+
+
+def parse_curator_json(raw_content: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Resposta da curadora não é JSON válido: {raw_content}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Resposta da curadora deve ser um objeto JSON.")
+    relevant_units = payload.get("relevant_units")
+    curated_context = payload.get("curated_context")
+    if not isinstance(relevant_units, list) or any(not isinstance(item, str) for item in relevant_units):
+        raise ValueError("Resposta da curadora exige 'relevant_units' como lista de strings.")
+    if not isinstance(curated_context, str) or not curated_context.strip():
+        raise ValueError("Resposta da curadora exige 'curated_context' não vazio.")
+    return {
+        "relevant_units": [item.strip() for item in relevant_units if item.strip()],
+        "curated_context": curated_context.strip(),
+    }
 
 
 def validate_select_sql(sql: str) -> None:
@@ -488,43 +638,73 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         session.history.append({"role": "user", "content": user_text})
-        try:
-            action_payload = session.orchestrate(user_text, structural_context)
-            execution_result = session.execute_action(action_payload)
-            if action_payload["action"] == "done":
-                final_text = session.interface_reply(
-                    "Apresente a conclusão final ao usuário com base no texto da orquestradora.",
+        last_error: str | None = None
+        last_result: str | None = None
+        executed_queries: list[str] = []
+        handled = False
+
+        for attempt_number in range(1, MAX_ATTEMPTS_PER_TURN + 1):
+            try:
+                action_payload = session.orchestrate(
+                    user_text,
+                    structural_context,
+                    last_error=last_error,
+                    last_result=last_result,
+                    executed_queries=executed_queries,
+                    attempt_number=attempt_number,
+                )
+                execution_result = session.execute_action(action_payload)
+                last_error = None
+                last_result = execution_result
+                if action_payload["action"] == "query":
+                    query_id = str(action_payload.get("query_id", "")).strip()
+                    if query_id and query_id not in executed_queries:
+                        executed_queries.append(query_id)
+                if action_payload["action"] == "done":
+                    final_text = session.interface_reply(
+                        "Apresente a conclusão final ao usuário com base no texto da orquestradora.",
+                        result_context=execution_result,
+                    )
+                    session.history.append({"role": "assistant", "content": compress_assistant_message(final_text)})
+                    print(f"\ncartographer> {final_text}")
+                    return 0
+
+                if action_payload["action"] == "tables":
+                    reply = render_tables_message(execution_result)
+                    session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
+                    print(f"\ncartographer> {reply}")
+                    handled = True
+                    break
+
+                if action_payload["action"] == "schema":
+                    reply = render_schema_message(execution_result)
+                    session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
+                    print(f"\ncartographer> {reply}")
+                    handled = True
+                    break
+
+                reply = session.interface_reply(
+                    "Explique este resultado ao usuário, responda à pergunta atual e sugira o próximo passo.",
                     result_context=execution_result,
                 )
-                session.history.append({"role": "assistant", "content": compress_assistant_message(final_text)})
-                print(f"\ncartographer> {final_text}")
-                return 0
-
-            if action_payload["action"] == "tables":
-                reply = render_tables_message(execution_result)
                 session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
                 print(f"\ncartographer> {reply}")
-                continue
+                handled = True
+                break
+            except Exception as exc:
+                last_error = f"Erro operacional: {exc}"
+                if attempt_number >= MAX_ATTEMPTS_PER_TURN:
+                    error_reply = session.interface_reply(
+                        "Explique ao usuário que não foi possível executar a análise pedida após múltiplas tentativas e sugira uma reformulação.",
+                        result_context=last_error,
+                    )
+                    session.history.append({"role": "assistant", "content": compress_assistant_message(error_reply)})
+                    print(f"\ncartographer> {error_reply}")
+                    handled = True
+                    break
 
-            if action_payload["action"] == "schema":
-                reply = render_schema_message(execution_result)
-                session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
-                print(f"\ncartographer> {reply}")
-                continue
-
-            reply = session.interface_reply(
-                "Explique este resultado ao usuário, responda à pergunta atual e sugira o próximo passo.",
-                result_context=execution_result,
-            )
-            session.history.append({"role": "assistant", "content": compress_assistant_message(reply)})
-            print(f"\ncartographer> {reply}")
-        except Exception as exc:
-            error_reply = session.interface_reply(
-                "Explique o erro de forma útil e oriente o usuário sobre como continuar.",
-                result_context=f"Erro operacional: {exc}",
-            )
-            session.history.append({"role": "assistant", "content": compress_assistant_message(error_reply)})
-            print(f"\ncartographer> {error_reply}")
+        if handled:
+            continue
 
 
 if __name__ == "__main__":
