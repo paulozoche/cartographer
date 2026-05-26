@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 from pathlib import Path
+import pytest
 
 from agnostic.ai.ports.ai_orchestrator import AIResponse
 from agnostic.infrastructure.ai.grok_client import GroqAPIError
@@ -20,6 +21,7 @@ def test_health_route_returns_ok() -> None:
 
 
 def test_root_route_returns_visual_interface() -> None:
+    pytest.skip("Interface visual baseada em cards foi desativada em favor do chat no terminal.")
     client = TestClient(create_app())
 
     response = client.get("/")
@@ -45,6 +47,7 @@ def test_root_route_returns_visual_interface() -> None:
 
 
 def test_root_route_summary_shows_origin_overview_and_table_previews(monkeypatch, tmp_path: Path) -> None:
+    pytest.skip("Interface visual baseada em cards foi desativada em favor do chat no terminal.")
     monkeypatch.setenv(
         "AGNOSTIC_DATA_ANALYSER_RESULTS_DIR",
         str(tmp_path / "results"),

@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments.
+    def load_dotenv() -> bool:
+        return False
+
+
+load_dotenv()
+
 
 DEFAULT_RESULTS_DIR = Path("/tmp/agnostic-data-analyser/runtime/canonical")
 DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"

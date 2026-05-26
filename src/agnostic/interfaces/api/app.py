@@ -154,6 +154,43 @@ LABELS = {
     }
 }
 
+VISUAL_INTERFACE_DISABLED_HTML = """
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Cartographer</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: monospace;
+        background: #f5f1e8;
+        color: #1f1f1f;
+      }
+      main {
+        max-width: 760px;
+        margin: 48px auto;
+        padding: 0 24px;
+      }
+      pre {
+        white-space: pre-wrap;
+        background: #fffdf8;
+        border: 1px solid #d8cfbf;
+        padding: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Cartographer</h1>
+      <p>A interface visual baseada em cards foi desativada.</p>
+      <p>Use <code>python chat.py &lt;caminho-do-arquivo&gt;</code> para a exploração conversacional no terminal.</p>
+      <pre>As rotas estruturadas da API permanecem disponíveis para integrações e testes de contrato.</pre>
+    </main>
+  </body>
+</html>
+"""
+
 
 def _ui(lang: str) -> dict[str, str]:
     return LABELS.get(lang, LABELS[DEFAULT_LANG])
@@ -2981,48 +3018,7 @@ def create_app() -> FastAPI:
         focus: bool = Query(False),
         lang: str = Query(DEFAULT_LANG),
     ) -> HTMLResponse:
-        result, status_line, unit_names, selected_unit, _ = _resolve_action(
-            source_type=source_type,
-            source_path=source_path,
-            action=action,
-            unit_name=unit_name,
-            column_name=column_name,
-            columns_text=columns,
-            rows_text=rows,
-            prompt=prompt,
-        )
-        html = _render_page(
-            source_type=source_type,
-            source_path=source_path,
-            unit_name=unit_name,
-            column_name=column_name,
-            columns_text=columns,
-            rows_text=rows,
-            prompt=prompt,
-            recorte_id=recorte_id,
-            relation_column=relation_column,
-            relation_values=relation_values,
-            exception_group=exception_group,
-            selected_value=selected_value,
-            selected_value_id=selected_value_id,
-            slice_mode=slice_mode,
-            signature_path=signature_path,
-            decision_type=decision_type,
-            origin_table=origin_table,
-            origin_signature=origin_signature,
-            origin_slice_type=origin_slice_type,
-            origin_condition=origin_condition,
-            context_filters=context_filters,
-            focus_mode=focus,
-            action=action,
-            result=result,
-            error=result.get("error") if isinstance(result, dict) else None,
-            unit_names=unit_names,
-            selected_unit=selected_unit,
-            jump_label=(result or {}).get("jump_target") and f"Jump target: {(result or {}).get('jump_target')}",
-            lang=lang,
-        )
-        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(VISUAL_INTERFACE_DISABLED_HTML, headers={"Cache-Control": "no-store"})
 
     @app.post("/upload-source", response_class=HTMLResponse)
     async def upload_source(
