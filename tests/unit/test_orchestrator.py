@@ -227,9 +227,35 @@ def test_orchestrate_system_prompt_forbids_done_on_error() -> None:
         attempt_number=2,
     )
     assert payload == {"action": "tables"}
-    assert "Nunca emita 'done' quando o resultado ou contexto de erro contiver 'erro' ou 'error'." in captured["system_prompt"]
-    assert "Nunca emita 'done' quando a mensagem do usuário for apenas uma confirmação curta" in captured["system_prompt"]
-    assert "Nunca gere SQL livremente." in captured["system_prompt"]
+    assert "LEI 1 — FORMATO ABSOLUTO" in captured["system_prompt"]
+    assert "LEI 2 — CATÁLOGO É EXATO, NÃO APROXIMADO" in captured["system_prompt"]
+    assert "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO" in captured["system_prompt"]
+    assert "LEI 4 — ERRO NÃO É CONCLUSÃO" in captured["system_prompt"]
+    assert "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA" in captured["system_prompt"]
+    assert "LEI 6 — NÃO REEXECUTE" in captured["system_prompt"]
+
+
+def test_interface_prompt_forbids_calculation_and_promises() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_path = "/tmp/sample.db"
+    session.source_type = "sqlite"
+    session.history = []
+    session._full_structural_context = "contexto"
+    session.curated_context_for = lambda user_text, is_first_call=False: "events: 10 linhas"
+
+    captured: dict[str, str] = {}
+
+    class FakeInterfaceAI:
+        def send(self, prompt: str, *, system_prompt: str | None = None):
+            captured["system_prompt"] = system_prompt or ""
+            return type("Response", (), {"content": "ok"})()
+
+    session.interface_ai = FakeInterfaceAI()
+    reply = session.interface_reply("me diga o percentual", result_context="sem dado", is_first_call=False)
+    assert reply == "ok"
+    assert "nunca calcula percentuais" in captured["system_prompt"]
+    assert "não tenho esse dado, aguarde a execução" in captured["system_prompt"]
+    assert "nunca promete executar algo" in captured["system_prompt"]
 
 
 def test_build_orchestrator_prompt_includes_last_result_and_queries() -> None:
