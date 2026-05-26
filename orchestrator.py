@@ -85,6 +85,46 @@ QUERY_CATALOG = {
         SELECT "Type", COUNT(*) as total
         FROM globalid GROUP BY "Type" ORDER BY total DESC
     """,
+    "knot_type_by_region_clean": """
+        SELECT km.REGION, k.TYPE_CODE, COUNT(*) as total
+        FROM knot k JOIN cord c ON k.CORD_ID = c.CORD_ID
+        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
+        WHERE km.REGION IS NOT NULL AND km.REGION != '' AND km.REGION != ' '
+        AND k.TYPE_CODE IS NOT NULL AND k.TYPE_CODE != ''
+        GROUP BY km.REGION, k.TYPE_CODE ORDER BY km.REGION, total DESC
+    """,
+    "knot_signature_by_region": """
+        SELECT km.REGION, k.TYPE_CODE, k.DIRECTION, COUNT(*) AS total
+        FROM knot k JOIN cord c ON k.CORD_ID = c.CORD_ID
+        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
+        WHERE km.REGION IS NOT NULL AND km.REGION != '' AND km.REGION != ' '
+        GROUP BY km.REGION, k.TYPE_CODE, k.DIRECTION ORDER BY km.REGION, total DESC
+    """,
+    "knot_signature_normalized": """
+        SELECT km.REGION, k.TYPE_CODE, k.DIRECTION,
+               COUNT(*) AS total,
+               ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY km.REGION), 2) AS pct_region
+        FROM knot k
+        JOIN cord c ON k.CORD_ID = c.CORD_ID
+        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
+        WHERE km.REGION IS NOT NULL AND TRIM(km.REGION) != ''
+        AND k.TYPE_CODE IS NOT NULL AND TRIM(k.TYPE_CODE) != '' AND TRIM(k.TYPE_CODE) != "''"
+        AND k.DIRECTION IS NOT NULL AND TRIM(k.DIRECTION) != ''
+        GROUP BY km.REGION, k.TYPE_CODE, k.DIRECTION
+        ORDER BY km.REGION, pct_region DESC
+    """,
+    "knot_signature_by_khipu": """
+        SELECT km.REGION, km.PROVENANCE, km.KHIPU_ID, k.TYPE_CODE, k.DIRECTION,
+               COUNT(*) AS total
+        FROM knot k
+        JOIN cord c ON k.CORD_ID = c.CORD_ID
+        JOIN khipu_main km ON c.KHIPU_ID = km.KHIPU_ID
+        WHERE km.REGION IS NOT NULL AND TRIM(km.REGION) != ''
+        AND k.TYPE_CODE IS NOT NULL AND TRIM(k.TYPE_CODE) != ''
+        AND k.DIRECTION IS NOT NULL AND TRIM(k.DIRECTION) != ''
+        GROUP BY km.REGION, km.PROVENANCE, km.KHIPU_ID, k.TYPE_CODE, k.DIRECTION
+        ORDER BY km.REGION, km.PROVENANCE, km.KHIPU_ID, total DESC
+    """,
 }
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_TIMEOUT_SECONDS = 30.0
@@ -298,6 +338,7 @@ class OrchestratorSession:
             "Você nunca calcula percentuais, nunca infere números e nunca produz valores que não vieram diretamente do core ou do banco.\n"
             "Você nunca promete executar algo e nunca usa frases como 'vou executar agora', 'vou investigar' ou 'precisamos executar'.\n"
             "Se um resultado não estiver disponível no contexto, diga apenas 'não tenho esse dado, aguarde a execução'.\n"
+            'Se o resultado contiver "truncated: true", você DEVE avisar o usuário que o resultado está incompleto e NÃO pode concluir sobre padrões, exclusividade ou predominância. Diga apenas: "resultado parcial — não é possível concluir ainda".\n'
         )
         prompt = build_interface_prompt(
             source_path=self.source_path,
@@ -437,14 +478,14 @@ class OrchestratorSession:
         with sqlite3.connect(self.source_path) as connection:
             cursor = connection.execute(sql)
             column_names = [item[0] for item in cursor.description or ()]
-            rows = cursor.fetchmany(50)
+            rows = cursor.fetchmany(200)
         return {
             "query_id": query_id,
             "sql": sql,
             "columns": column_names,
             "rows": rows,
             "row_count_preview": len(rows),
-            "truncated": len(rows) == 50,
+            "truncated": len(rows) == 200,
         }
 
     def catalog_for_session(self) -> dict[str, str]:
@@ -479,14 +520,14 @@ class OrchestratorSession:
         with sqlite3.connect(self.source_path) as connection:
             cursor = connection.execute(sql)
             column_names = [item[0] for item in cursor.description or ()]
-            rows = cursor.fetchmany(50)
+            rows = cursor.fetchmany(200)
         if not rows:
             raise ValueError("A nova query foi rejeitada porque não retornou linhas.")
         return {
             "columns": column_names,
             "rows": rows,
             "row_count_preview": len(rows),
-            "truncated": len(rows) == 50,
+            "truncated": len(rows) == 200,
         }
 
 
