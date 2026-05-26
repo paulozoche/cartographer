@@ -145,6 +145,21 @@ def test_parse_curator_json_rejects_invalid_payload() -> None:
         raise AssertionError("Payload inválido da curadora deveria ser rejeitado.")
 
 
+def test_validate_join_columns_exist_rejects_missing_link_column() -> None:
+    try:
+        orchestrator.validate_join_columns_exist(
+            'SELECT * FROM khipu_main km JOIN cord c ON km.ID_INEXISTENTE = c.KHIPU_ID',
+            schema_columns={
+                "khipu_main": {"KHIPU_ID", "REGION"},
+                "cord": {"CORD_ID", "KHIPU_ID"},
+            },
+        )
+    except ValueError as exc:
+        assert "coluna de ligação inexistente" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("JOIN com coluna inexistente deveria ser rejeitado.")
+
+
 def test_should_use_curator_only_after_first_call_and_with_more_than_three_units() -> None:
     session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
     session.units = [
@@ -176,6 +191,34 @@ def test_curated_context_for_falls_back_to_full_context_on_failure() -> None:
     session.curator_ai = FailingCurator()
     result = session.curated_context_for("pergunta", is_first_call=False)
     assert result == "contexto completo"
+
+
+def test_build_structural_context_flags_empty_units() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_path = "/tmp/sample.db"
+    session.source_type = "sqlite"
+    session.units = [type("Unit", (), {"unit_name": "events"})()]
+
+    analysis = type(
+        "Analysis",
+        (),
+        {
+            "unit_name": "events",
+            "standardized": type("Standardized", (), {"row_count": 0})(),
+        },
+    )()
+
+    original_summary = orchestrator.summarize_tabular_analysis
+    original_metrics = orchestrator.summarize_unit_metrics
+    orchestrator.summarize_tabular_analysis = lambda _: "Unidade events: 0 linhas e 2 colunas."
+    orchestrator.summarize_unit_metrics = lambda _: ["events: 0 linhas, 2 colunas."]
+    try:
+        context = session.build_structural_context([analysis])
+    finally:
+        orchestrator.summarize_tabular_analysis = original_summary
+        orchestrator.summarize_unit_metrics = original_metrics
+
+    assert "ALERTA: a unidade events está vazia (0 linhas)." in context
 
 
 def test_build_orchestrator_prompt_includes_attempt_and_error_context() -> None:
@@ -335,6 +378,71 @@ def test_register_session_query_rejects_invalid_sql(tmp_path) -> None:
         assert "SELECT" in str(exc) or "não permitido" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("SQL inválido deveria ser rejeitado.")
+
+
+def test_register_session_query_rejects_invalid_join_columns(tmp_path) -> None:
+    db_path = tmp_path / "sample.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE khipu_main (KHIPU_ID TEXT, REGION TEXT)")
+        connection.execute("CREATE TABLE cord (CORD_ID TEXT, KHIPU_ID TEXT)")
+        connection.execute("INSERT INTO khipu_main (KHIPU_ID, REGION) VALUES ('K1', 'PE')")
+        connection.execute("INSERT INTO cord (CORD_ID, KHIPU_ID) VALUES ('C1', 'K1')")
+        connection.commit()
+
+    unit_main = type(
+        "Unit",
+        (),
+        {
+            "unit_name": "khipu_main",
+            "get_structure": lambda self: type(
+                "Structure",
+                (),
+                {
+                    "columns": (
+                        type("Column", (), {"name": "KHIPU_ID"})(),
+                        type("Column", (), {"name": "REGION"})(),
+                    )
+                },
+            )(),
+        },
+    )()
+    unit_cord = type(
+        "Unit",
+        (),
+        {
+            "unit_name": "cord",
+            "get_structure": lambda self: type(
+                "Structure",
+                (),
+                {
+                    "columns": (
+                        type("Column", (), {"name": "CORD_ID"})(),
+                        type("Column", (), {"name": "KHIPU_ID"})(),
+                    )
+                },
+            )(),
+        },
+    )()
+
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_type = "sqlite"
+    session.source_path = str(db_path)
+    session.units = [unit_main, unit_cord]
+    session._session_query_catalog = {}
+    session._candidate_queries = []
+
+    try:
+        session._register_session_query(
+            description="join inválido",
+            suggested_sql=(
+                "SELECT * FROM khipu_main km "
+                "JOIN cord c ON km.ID_INEXISTENTE = c.KHIPU_ID"
+            ),
+        )
+    except ValueError as exc:
+        assert "coluna de ligação inexistente" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("JOIN inválido deveria ser rejeitado.")
 
 
 def test_session_query_becomes_available_in_same_session(tmp_path) -> None:

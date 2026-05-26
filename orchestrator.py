@@ -231,6 +231,11 @@ class OrchestratorSession:
         ]
         for analysis in analyses:
             sections.append(summarize_tabular_analysis(analysis))
+            if int(analysis.standardized.row_count) == 0:
+                sections.append(
+                    f"ALERTA: a unidade {analysis.unit_name} está vazia (0 linhas). "
+                    "Consultas sobre ela não retornarão dados até haver conteúdo."
+                )
             sections.extend(summarize_unit_metrics(analysis))
         return "\n\n".join(sections)
 
@@ -334,11 +339,16 @@ class OrchestratorSession:
             "Só use action=query quando o query_id atender EXATAMENTE ao pedido.\n"
             "Exato significa: mesmas colunas, mesmo filtro, mesmo agrupamento.\n"
             "Semelhante não é exato. Parecido não é exato.\n"
+            "Escolha action=schema APENAS quando o usuário perguntar explicitamente sobre a estrutura ou colunas de uma tabela.\n"
+            "Perguntas como 'localize', 'busque', 'encontre' e 'mostre' são sempre action=query ou action=request_new_query.\n"
             "Se houver dúvida, use request_new_query.\n\n"
             "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO:\n"
             "Se nenhum query_id do catálogo atender exatamente, SEMPRE emita request_new_query.\n"
             "Nunca emita done quando faltar dados para responder.\n"
-            "Nunca deixe a Interface inventar dados.\n\n"
+            "Nunca deixe a Interface inventar dados.\n"
+            "No suggested_sql de request_new_query, gere APENAS SELECT simples com condições básicas.\n"
+            "Para cruzar múltiplas tabelas, use subqueries simples.\n"
+            "Nunca gere SQL que combine condições de tabelas diferentes sem JOIN explícito.\n\n"
             "LEI 4 — ERRO NÃO É CONCLUSÃO:\n"
             "Nunca emita done quando o contexto contiver 'erro' ou 'error'.\n"
             "Em caso de erro, tente request_new_query com SQL corrigido.\n\n"
@@ -440,10 +450,35 @@ class OrchestratorSession:
             **getattr(self, "_session_query_catalog", {}),
         }
 
+    def schema_columns_by_unit(self) -> dict[str, set[str]]:
+        schema: dict[str, set[str]] = {}
+        units = getattr(self, "units", None)
+        if units:
+            for unit in units:
+                try:
+                    structure = unit.get_structure()
+                except Exception:
+                    continue
+                schema[unit.unit_name] = {column.name for column in structure.columns}
+            return schema
+
+        if getattr(self, "source_type", "") != "sqlite":
+            return schema
+
+        with sqlite3.connect(self.source_path) as connection:
+            cursor = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+            )
+            for (table_name,) in cursor.fetchall():
+                info_cursor = connection.execute(f'PRAGMA table_info("{table_name}")')
+                schema[str(table_name)] = {str(row[1]) for row in info_cursor.fetchall()}
+        return schema
+
     def _register_session_query(self, *, description: str, suggested_sql: str) -> dict[str, object]:
         if self.source_type != "sqlite":
             raise ValueError("Queries novas em sessão estão disponíveis apenas para fontes SQLite neste MVP.")
         validated_sql = validate_select_sql_text(suggested_sql)
+        validate_join_columns_exist(validated_sql, schema_columns=self.schema_columns_by_unit())
         preview = self._validate_and_preview_sql(validated_sql)
         query_id = generate_query_id(description, existing_ids=set(self.catalog_for_session().keys()))
         self._session_query_catalog[query_id] = validated_sql
@@ -666,6 +701,32 @@ def validate_select_sql_text(sql: str) -> str:
 
 def validate_select_sql(sql: str) -> None:
     validate_select_sql_text(sql)
+
+
+def validate_join_columns_exist(sql: str, *, schema_columns: dict[str, set[str]]) -> None:
+    alias_to_table: dict[str, str] = {}
+    table_alias_pattern = re.compile(
+        r'\b(?:FROM|JOIN)\s+"?([^"\s]+)"?(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?',
+        flags=re.IGNORECASE,
+    )
+    for table_name, alias in table_alias_pattern.findall(sql):
+        resolved_alias = alias or table_name
+        alias_to_table[resolved_alias] = table_name
+        alias_to_table[table_name] = table_name
+
+    join_condition_pattern = re.compile(
+        r'([A-Za-z_][A-Za-z0-9_]*)\."?([^"\s=]+)"?\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\."?([^"\s=]+)"?',
+        flags=re.IGNORECASE,
+    )
+    for left_alias, left_column, right_alias, right_column in join_condition_pattern.findall(sql):
+        left_table = alias_to_table.get(left_alias)
+        right_table = alias_to_table.get(right_alias)
+        if left_table is None or right_table is None:
+            raise ValueError("JOIN rejeitado: aliases de tabela não foram resolvidos no schema.")
+        if left_column not in schema_columns.get(left_table, set()):
+            raise ValueError(f"JOIN rejeitado: coluna de ligação inexistente {left_table}.{left_column}.")
+        if right_column not in schema_columns.get(right_table, set()):
+            raise ValueError(f"JOIN rejeitado: coluna de ligação inexistente {right_table}.{right_column}.")
 
 
 def generate_query_id(description: str, *, existing_ids: set[str]) -> str:
