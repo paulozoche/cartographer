@@ -323,16 +323,12 @@ Path:
 
 Responsibility:
 
-Expor o sistema para consumidores externos por API, schemas, rotas, rendering e assets de interface.
+Conter helpers mínimos de fronteira sem assumir API, rotas ou rendering.
 
 Owns:
 
-- rotas HTTP;
-- schemas externos;
-- validação externa;
-- rendering de API/UI;
-- assets estáticos de interface;
-- dependências de API.
+- identidade de valor para fronteiras externas;
+- normalização leve de comparação entre valores.
 
 Does not own:
 
@@ -340,19 +336,18 @@ Does not own:
 - métricas;
 - heurísticas;
 - ranking;
+- API HTTP;
+- rotas;
+- schemas de request/response;
+- rendering visual;
+- assets estáticos;
 - persistência analítica;
 - assinatura de compartilhamento;
 - regras internas de domínio.
 
-Important subpackages:
+Important files:
 
-- `interfaces/api/`
-- `interfaces/api/rendering/`
-- `interfaces/api/static/`
-
-Pending decisions:
-
-- Escopo público real de `interfaces` é `NEEDS_ARCHITECTURE_DECISION`: somente API/schemas externos ou também helpers de rendering.
+- `interfaces/value_identity.py`
 
 Planned local docs:
 
@@ -399,13 +394,6 @@ Important subpackages:
 - `infrastructure/db/`
 - `infrastructure/export/`
 - `infrastructure/storage/`
-
-Empty or reserved subpackages:
-
-- `infrastructure/auth/`
-- `infrastructure/config/`
-- `infrastructure/queue/`
-- `infrastructure/rate_limit/`
 
 Planned local docs:
 

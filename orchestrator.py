@@ -492,11 +492,23 @@ class OrchestratorSession:
             "LEI 4 — ERRO NÃO É CONCLUSÃO:\n"
             "Nunca emita done quando o contexto contiver 'erro' ou 'error'.\n"
             "Em caso de erro, tente request_new_query com SQL corrigido.\n\n"
-            "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA:\n"
-            "Nunca emita done quando o usuário disser apenas: sim, ok, continue, prossiga, execute.\n"
-            "Nesses casos, execute a próxima ação lógica.\n\n"
+            "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA E NÃO PARALISA:\n"
+            '"sim", "ok", "pode", "prossiga", "continue", "vai", "execute" após uma sugestão da Interface = executar a ação sugerida.\n'
+            "Para identificar qual ação executar:\n"
+            "1. Ler a última mensagem do histórico da Interface\n"
+            "2. Identificar a ação sugerida (query, template, analyze_unit)\n"
+            "3. Executar essa ação\n"
+            "EXEMPLO LEI 5:\n"
+            'Histórico mostra Interface sugerindo: "Quer que eu explore crime_scene_report?"\n'
+            'Usuário responde: "sim"\n'
+            'Resposta CORRETA: {"action": "analyze_unit", "unit_name": "crime_scene_report"}\n'
+            'Resposta ERRADA: {"action": "tables"}\n'
+            'Resposta ERRADA: {"action": "done", "conclusion": "..."}\n'
+            'Nunca responder com "preciso de instrução clara" quando houver uma sugestão pendente no histórico.\n\n'
             "LEI 6 — NÃO REEXECUTE:\n"
             "Se já existe resultado válido no turno atual, não reexecute o mesmo query_id.\n"
+            "Se o contexto já contém resultado de uma query sobre X, NÃO execute novamente a mesma query sobre X.\n"
+            '"sim", "localize", "consulte", "faça" após um resultado significam AVANÇAR para o próximo passo lógico, não repetir.\n'
             "Use o resultado existente para decidir o próximo passo.\n"
             'Quando o usuário quiser aprofundar uma tabela específica, use:\n{"action":"analyze_unit","unit_name":"nome_da_tabela"}\n'
             "Só analise tabelas que o usuário pediu explicitamente.\n"
@@ -600,6 +612,8 @@ class OrchestratorSession:
             graph = self.knowledge_graph
 
         node = self._knowledge_node_from_result(result, action=action)
+        if any(existing.unit == node.unit and existing.label == node.label for existing in graph.nodes):
+            return
         graph.nodes.append(node)
         heuristic_edge = self._heuristic_knowledge_edge(node)
         if heuristic_edge is not None:

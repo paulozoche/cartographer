@@ -3,94 +3,375 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Cartographer Web</title>
+    <title>Cartographer</title>
     <style>
       :root {
-        --bg: #09111c;
-        --panel: #0f1b2d;
-        --panel-2: #14243a;
-        --text: #d9e7ff;
-        --muted: #90a4c2;
-        --accent: #4dd6a7;
-        --accent-2: #67b7ff;
-        --border: #22344f;
-        --danger: #ff7c7c;
+        --bg: #1a1610;
+        --bg-soft: #211b13;
+        --panel: rgba(31, 25, 17, 0.92);
+        --panel-2: rgba(38, 30, 20, 0.94);
+        --parchment: linear-gradient(180deg, rgba(53, 44, 29, 0.96), rgba(41, 34, 23, 0.98));
+        --gold: #d4a843;
+        --text: #c8b88a;
+        --text-soft: #a89668;
+        --text-dim: #84724d;
+        --border: rgba(140, 110, 60, 0.3);
+        --border-strong: rgba(212, 168, 67, 0.45);
+        --glow: rgba(212, 168, 67, 0.14);
+        --danger: #d47a62;
+        --success: #8fa66a;
+        --shadow: 0 22px 60px rgba(0, 0, 0, 0.35);
       }
-      * { box-sizing: border-box; }
-      body {
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html, body {
         margin: 0;
-        min-height: 100vh;
+        min-height: 100%;
         background:
-          radial-gradient(circle at top, rgba(103,183,255,0.12), transparent 32%),
-          linear-gradient(180deg, #09111c 0%, #07101a 100%);
+          linear-gradient(rgba(212, 168, 67, 0.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(212, 168, 67, 0.05) 1px, transparent 1px),
+          radial-gradient(circle at top, rgba(212, 168, 67, 0.08), transparent 28%),
+          linear-gradient(180deg, #1d1811 0%, #1a1610 100%);
+        background-size: 34px 34px, 34px 34px, auto, auto;
         color: var(--text);
-        font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font: 15px/1.6 "IBM Plex Mono", "Fira Code", "SFMono-Regular", Consolas, monospace;
       }
-      .shell {
-        max-width: 1100px;
-        margin: 0 auto;
-        padding: 24px;
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(212, 168, 67, 0.05), transparent 24%),
+          radial-gradient(circle at 82% 82%, rgba(212, 168, 67, 0.04), transparent 22%);
+        opacity: 0.9;
       }
-      .hero, .panel {
-        background: rgba(15, 27, 45, 0.9);
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .app-shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        padding: 20px;
+        gap: 18px;
+      }
+
+      .topbar,
+      .sidebar,
+      .main-panel,
+      .statusbar {
         border: 1px solid var(--border);
-        border-radius: 18px;
-        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+        background: var(--panel);
+        box-shadow: var(--shadow);
       }
-      .hero {
-        padding: 24px;
-        margin-bottom: 18px;
-      }
-      h1 {
-        margin: 0 0 8px;
-        font-size: 28px;
-      }
-      .lede {
-        margin: 0;
-        color: var(--muted);
-      }
-      .upload-bar {
+
+      .topbar {
         display: flex;
-        gap: 12px;
-        flex-wrap: wrap;
         align-items: center;
-        margin-top: 18px;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 16px 20px;
+        border-radius: 18px;
+        backdrop-filter: blur(6px);
       }
-      .panel {
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+        color: var(--gold);
+        filter: drop-shadow(0 0 10px rgba(212, 168, 67, 0.15));
+      }
+
+      .brand-copy {
+        min-width: 0;
+      }
+
+      .brand-copy h1 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: 0.28em;
+        color: var(--gold);
+        font-weight: 700;
+      }
+
+      .brand-copy p {
+        margin: 3px 0 0;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .topbar-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .settings-button,
+      .upload-button,
+      .send-button,
+      .copy-button {
+        border: 1px solid var(--border-strong);
+        color: var(--gold);
+        background: linear-gradient(180deg, rgba(47, 37, 24, 0.98), rgba(31, 25, 17, 0.98));
+        border-radius: 12px;
+        cursor: pointer;
+        transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+      }
+
+      .settings-button:hover,
+      .upload-button:hover,
+      .send-button:hover,
+      .copy-button:hover {
+        transform: translateY(-1px);
+        border-color: rgba(212, 168, 67, 0.72);
+      }
+
+      .settings-button {
+        width: 42px;
+        height: 42px;
+        font-size: 19px;
+      }
+
+      .workspace {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        gap: 18px;
+      }
+
+      .sidebar,
+      .main-panel {
+        border-radius: 22px;
+        overflow: hidden;
+        min-height: 0;
+      }
+
+      .sidebar {
         display: flex;
         flex-direction: column;
-        min-height: 68vh;
-        overflow: hidden;
+        background:
+          linear-gradient(180deg, rgba(35, 28, 19, 0.98), rgba(26, 22, 16, 0.98));
       }
-      .status {
-        padding: 12px 16px;
+
+      .sidebar-header {
+        padding: 18px 18px 14px;
         border-bottom: 1px solid var(--border);
-        color: var(--muted);
-        background: rgba(20, 36, 58, 0.8);
       }
-      .chat-log {
+
+      .sidebar-header h2 {
+        margin: 0;
+        color: var(--gold);
+        font-size: 15px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .sidebar-header p {
+        margin: 6px 0 0;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .sidebar-scroll {
         flex: 1;
         overflow-y: auto;
-        padding: 20px;
+        padding: 16px 14px 18px;
+      }
+
+      .sidebar-section + .sidebar-section {
+        margin-top: 20px;
+      }
+
+      .sidebar-section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        color: var(--text-soft);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+      }
+
+      .table-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
         display: flex;
         flex-direction: column;
-        gap: 24px;
+        gap: 8px;
       }
-      .exchange {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        padding-top: 6px;
-        border-top: 1px solid rgba(103, 183, 255, 0.12);
-      }
-      .message {
-        max-width: 86%;
-        padding: 14px 16px;
-        border-radius: 16px;
+
+      .table-chip {
         border: 1px solid var(--border);
-        white-space: pre-wrap;
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: rgba(255, 248, 220, 0.02);
+      }
+
+      .table-chip strong {
+        display: block;
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      .table-chip span {
+        display: block;
+        margin-top: 3px;
+        color: var(--text-dim);
+        font-size: 11px;
+      }
+
+      .table-chip.explored {
+        border-color: rgba(212, 168, 67, 0.4);
+        box-shadow: inset 0 0 0 1px rgba(212, 168, 67, 0.04);
+      }
+
+      .table-chip.pending {
+        border-style: dashed;
+        opacity: 0.88;
+      }
+
+      .table-chip.empty {
+        color: var(--text-dim);
+      }
+
+      .main-panel {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        background:
+          radial-gradient(circle at bottom right, rgba(212, 168, 67, 0.06), transparent 24%),
+          linear-gradient(180deg, rgba(36, 29, 20, 0.98), rgba(27, 22, 16, 0.98));
         position: relative;
       }
+
+      .chat-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .chat-header-copy h2 {
+        margin: 0;
+        font-size: 16px;
+        color: var(--gold);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .chat-header-copy p {
+        margin: 6px 0 0;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .upload-controls {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .file-label {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 220px;
+        max-width: 320px;
+        padding: 11px 14px;
+        border: 1px dashed var(--border-strong);
+        border-radius: 12px;
+        color: var(--text-soft);
+        background: rgba(255, 248, 220, 0.025);
+        overflow: hidden;
+      }
+
+      .file-label input[type="file"] {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        cursor: pointer;
+      }
+
+      .file-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .upload-button,
+      .send-button {
+        padding: 11px 16px;
+        min-height: 44px;
+      }
+
+      .chat-log {
+        min-height: 0;
+        overflow-y: auto;
+        padding: 24px 24px 28px;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .message {
+        max-width: min(760px, 88%);
+        padding: 16px 18px 15px;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        background: var(--parchment);
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+        position: relative;
+      }
+
+      .message::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        pointer-events: none;
+        background: linear-gradient(180deg, rgba(255, 238, 194, 0.02), transparent 36%);
+      }
+
+      .message.user {
+        align-self: flex-end;
+        border-color: rgba(212, 168, 67, 0.42);
+        background: linear-gradient(180deg, rgba(72, 56, 32, 0.96), rgba(52, 40, 24, 0.98));
+      }
+
+      .message.bot {
+        align-self: flex-start;
+      }
+
+      .message.system {
+        align-self: center;
+        max-width: 90%;
+        text-align: center;
+        color: var(--text-soft);
+        background: linear-gradient(180deg, rgba(43, 35, 23, 0.94), rgba(31, 26, 18, 0.98));
+      }
+
       .message-header {
         display: flex;
         align-items: center;
@@ -98,185 +379,410 @@
         gap: 12px;
         margin-bottom: 10px;
       }
+
       .message-label {
-        font-size: 12px;
+        font-size: 11px;
+        letter-spacing: 0.18em;
         text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-weight: 700;
+        color: var(--gold);
       }
-      .message-copy {
-        border: 1px solid var(--border);
-        background: rgba(255,255,255,0.04);
-        color: var(--text);
+
+      .copy-button {
         padding: 6px 10px;
+        font-size: 11px;
         border-radius: 999px;
-        font-size: 12px;
-        line-height: 1;
       }
-      .message-copy.copied {
-        background: rgba(77, 214, 167, 0.2);
-        color: var(--accent);
+
+      .copy-button.copied {
+        color: #1a1610;
+        background: linear-gradient(180deg, rgba(212, 168, 67, 0.95), rgba(180, 137, 42, 0.95));
       }
-      .message.user {
-        align-self: flex-end;
-        background: rgba(103, 183, 255, 0.12);
+
+      .message-body {
+        position: relative;
+        z-index: 1;
+        color: var(--text);
+        word-break: break-word;
       }
-      .message.bot {
-        align-self: flex-start;
-        background: rgba(77, 214, 167, 0.08);
+
+      .message-body > *:first-child {
+        margin-top: 0;
       }
-      .message.system {
-        align-self: center;
-        background: rgba(255,255,255,0.04);
-        color: var(--muted);
-      }
-      .message.user .message-label {
-        color: var(--accent-2);
-      }
-      .message.bot .message-label {
-        color: var(--accent);
-      }
-      .message.system .message-label {
-        color: var(--muted);
-      }
+
       .message-body > *:last-child {
         margin-bottom: 0;
       }
-      .composer {
-        padding: 16px;
-        border-top: 1px solid var(--border);
-        background: rgba(9, 17, 28, 0.75);
-      }
-      .composer form {
-        display: flex;
-        gap: 12px;
-      }
-      input[type="file"],
-      input[type="text"] {
-        background: #08111d;
-        color: var(--text);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-      }
-      input[type="file"] {
-        padding: 10px;
-      }
-      input[type="text"] {
-        flex: 1;
-        padding: 14px 16px;
-      }
-      button {
-        border: 0;
-        border-radius: 12px;
-        padding: 12px 18px;
-        font: inherit;
-        color: #08111d;
-        background: linear-gradient(135deg, var(--accent), var(--accent-2));
-        cursor: pointer;
-        font-weight: 700;
-      }
-      button:disabled {
-        opacity: 0.45;
-        cursor: wait;
-      }
-      .error {
-        color: var(--danger);
-      }
-      .message.bot h1, .message.bot h2, .message.bot h3,
-      .message.bot p, .message.bot ul, .message.bot ol {
-        margin-top: 0;
-      }
-      code {
-        background: rgba(255,255,255,0.07);
-        padding: 0.1rem 0.35rem;
+
+      .message-body code {
+        background: rgba(0, 0, 0, 0.18);
+        padding: 0.08rem 0.35rem;
         border-radius: 6px;
       }
-      @media (max-width: 800px) {
-        .shell { padding: 14px; }
-        .message { max-width: 100%; }
-        .composer form, .upload-bar { flex-direction: column; align-items: stretch; }
-        button { width: 100%; }
+
+      .message-body pre {
+        overflow-x: auto;
+        padding: 12px;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.18);
+        border: 1px solid rgba(212, 168, 67, 0.12);
+      }
+
+      .composer {
+        padding: 18px 22px 22px;
+        border-top: 1px solid var(--border);
+      }
+
+      .composer-form {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+      }
+
+      .composer-input {
+        width: 100%;
+        min-height: 50px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(18, 15, 11, 0.96);
+        color: var(--text);
+        padding: 14px 16px;
+        outline: none;
+      }
+
+      .composer-input::placeholder {
+        color: var(--text-dim);
+      }
+
+      .statusbar {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1px;
+        border-radius: 16px;
+        overflow: hidden;
+      }
+
+      .status-item {
+        padding: 12px 14px;
+        background: var(--panel-2);
+      }
+
+      .status-label {
+        display: block;
+        color: var(--text-dim);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        margin-bottom: 4px;
+      }
+
+      .status-value {
+        display: block;
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      .compass-decor {
+        position: absolute;
+        right: 20px;
+        bottom: 94px;
+        width: 116px;
+        height: 116px;
+        color: rgba(212, 168, 67, 0.18);
+        pointer-events: none;
+      }
+
+      .compass-decor svg,
+      .brand-mark svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        border: 0;
+      }
+
+      @media (max-width: 1040px) {
+        .workspace {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          order: 2;
+        }
+
+        .main-panel {
+          order: 1;
+          min-height: 72vh;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .app-shell {
+          padding: 12px;
+          gap: 12px;
+        }
+
+        .topbar,
+        .chat-header,
+        .composer {
+          padding-left: 14px;
+          padding-right: 14px;
+        }
+
+        .topbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .topbar-actions,
+        .upload-controls {
+          width: 100%;
+        }
+
+        .upload-controls {
+          justify-content: stretch;
+        }
+
+        .file-label,
+        .upload-button,
+        .send-button {
+          width: 100%;
+          max-width: none;
+        }
+
+        .chat-header {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .message {
+          max-width: 100%;
+        }
+
+        .composer-form {
+          grid-template-columns: 1fr;
+        }
+
+        .statusbar {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .compass-decor {
+          width: 86px;
+          height: 86px;
+          right: 14px;
+          bottom: 112px;
+        }
       }
     </style>
   </head>
   <body>
-    <div class="shell">
-      <section class="hero">
-        <h1>Cartographer Web</h1>
-        <p class="lede">Upload do arquivo no topo, conversa abaixo. A lógica continua no mesmo orquestrador do terminal.</p>
-        <div class="upload-bar">
-          <input id="fileInput" type="file" accept=".csv,.parquet,.db,.sqlite,.sqlite3" />
-          <button id="uploadButton" type="button">Enviar arquivo</button>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="50" cy="50" r="34" opacity="0.45"></circle>
+              <path d="M50 10L57 43L50 50L43 43L50 10Z" fill="currentColor"></path>
+              <path d="M90 50L57 57L50 50L57 43L90 50Z" opacity="0.75"></path>
+              <path d="M50 90L43 57L50 50L57 57L50 90Z" opacity="0.45"></path>
+              <path d="M10 50L43 43L50 50L43 57L10 50Z" opacity="0.75"></path>
+              <circle cx="50" cy="50" r="6" fill="currentColor"></circle>
+            </svg>
+          </div>
+          <div class="brand-copy">
+            <h1>CARTOGRAPHER</h1>
+            <p>Exploração conversacional com mapa de conhecimento.</p>
+          </div>
         </div>
-      </section>
+        <div class="topbar-actions">
+          <button class="settings-button" type="button" aria-label="Configurações" title="Configurações futuras" disabled>⚙</button>
+        </div>
+      </header>
 
-      <section class="panel">
-        <div id="status" class="status">Nenhum arquivo carregado.</div>
-        <div id="chatLog" class="chat-log">
-          <div class="message system">Faça upload de um arquivo SQLite, CSV ou Parquet para iniciar a sessão.</div>
+      <div class="workspace">
+        <aside class="sidebar">
+          <div class="sidebar-header">
+            <h2>Mapa da Sessão</h2>
+            <p>Tabelas exploradas e caminhos ainda pendentes, atualizados via comando <code>mapa</code>.</p>
+          </div>
+          <div class="sidebar-scroll">
+            <section class="sidebar-section">
+              <div class="sidebar-section-title">
+                <span>Exploradas</span>
+                <span id="exploredCount">0</span>
+              </div>
+              <ul id="exploredList" class="table-list">
+                <li class="table-chip empty"><strong>Nenhuma ainda</strong><span>Envie <code>mapa</code> após a análise começar.</span></li>
+              </ul>
+            </section>
+            <section class="sidebar-section">
+              <div class="sidebar-section-title">
+                <span>Pendentes</span>
+                <span id="pendingCount">0</span>
+              </div>
+              <ul id="pendingList" class="table-list">
+                <li class="table-chip empty"><strong>Nenhuma pendência mapeada</strong><span>O grafo ainda não informou caminhos abertos.</span></li>
+              </ul>
+            </section>
+          </div>
+        </aside>
+
+        <main class="main-panel">
+          <div class="chat-header">
+            <div class="chat-header-copy">
+              <h2>Diário de Bordo</h2>
+              <p>Upload funcional, histórico preservado, markdown renderizado e comando <code>mapa</code> ativo.</p>
+            </div>
+            <div class="upload-controls">
+              <label class="file-label">
+                <span>Arquivo</span>
+                <span id="fileName" class="file-name">Nenhum arquivo selecionado</span>
+                <input id="fileInput" type="file" accept=".csv,.parquet,.db,.sqlite,.sqlite3" />
+              </label>
+              <button id="uploadButton" class="upload-button" type="button">Enviar arquivo</button>
+            </div>
+          </div>
+
+          <div id="chatLog" class="chat-log">
+            <div class="message system">
+              <div class="message-header">
+                <div class="message-label">Sistema</div>
+                <button class="copy-button" type="button" disabled>Copiar</button>
+              </div>
+              <div class="message-body">Faça upload de um arquivo SQLite, CSV ou Parquet para iniciar a sessão.</div>
+            </div>
+          </div>
+
+          <div class="compass-decor" aria-hidden="true">
+            <svg viewBox="0 0 140 140" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="70" cy="70" r="48"></circle>
+              <circle cx="70" cy="70" r="29" opacity="0.7"></circle>
+              <path d="M70 14L79 58L70 70L61 58L70 14Z" fill="currentColor"></path>
+              <path d="M126 70L82 79L70 70L82 61L126 70Z"></path>
+              <path d="M70 126L61 82L70 70L79 82L70 126Z"></path>
+              <path d="M14 70L58 61L70 70L58 79L14 70Z"></path>
+              <path d="M34 34L57 57"></path>
+              <path d="M106 34L83 57"></path>
+              <path d="M34 106L57 83"></path>
+              <path d="M106 106L83 83"></path>
+              <text x="70" y="9" text-anchor="middle" fill="currentColor" stroke="none" font-size="10">N</text>
+            </svg>
+          </div>
+
+          <div class="composer">
+            <form id="chatForm" class="composer-form">
+              <label class="sr-only" for="messageInput">Mensagem</label>
+              <input id="messageInput" class="composer-input" type="text" placeholder="Digite sua pergunta ou use o comando mapa..." autocomplete="off" disabled />
+              <button id="sendButton" class="send-button" type="submit" disabled>Enviar</button>
+            </form>
+          </div>
+        </main>
+      </div>
+
+      <footer class="statusbar">
+        <div class="status-item">
+          <span class="status-label">Servidor</span>
+          <span id="serverStatus" class="status-value">Aguardando conexão</span>
         </div>
-        <div class="composer">
-          <form id="chatForm">
-            <input id="messageInput" type="text" placeholder="Digite sua pergunta..." autocomplete="off" disabled />
-            <button id="sendButton" type="submit" disabled>Enviar</button>
-          </form>
+        <div class="status-item">
+          <span class="status-label">Session ID</span>
+          <span id="sessionStatus" class="status-value">não iniciada</span>
         </div>
-      </section>
+        <div class="status-item">
+          <span class="status-label">Tabelas</span>
+          <span id="tableStatus" class="status-value">0 exploradas / 0 pendentes</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Nós do Grafo</span>
+          <span id="graphStatus" class="status-value">0 nós</span>
+        </div>
+      </footer>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
-      const statusEl = document.getElementById("status");
       const chatLog = document.getElementById("chatLog");
       const uploadButton = document.getElementById("uploadButton");
       const fileInput = document.getElementById("fileInput");
+      const fileName = document.getElementById("fileName");
       const chatForm = document.getElementById("chatForm");
       const messageInput = document.getElementById("messageInput");
       const sendButton = document.getElementById("sendButton");
+      const serverStatus = document.getElementById("serverStatus");
+      const sessionStatus = document.getElementById("sessionStatus");
+      const tableStatus = document.getElementById("tableStatus");
+      const graphStatus = document.getElementById("graphStatus");
+      const exploredList = document.getElementById("exploredList");
+      const pendingList = document.getElementById("pendingList");
+      const exploredCount = document.getElementById("exploredCount");
+      const pendingCount = document.getElementById("pendingCount");
 
       let sessionId = "";
+      let lastUserMessage = "";
+      let mapState = {
+        explored: [],
+        pending: [],
+        nodeCount: 0,
+      };
 
-      function setBusy(isBusy, label) {
+      function setBusy(isBusy, statusText) {
         uploadButton.disabled = isBusy;
         sendButton.disabled = isBusy || !sessionId;
         messageInput.disabled = isBusy || !sessionId;
-        statusEl.textContent = label;
+        serverStatus.textContent = isBusy ? "Processando" : "Ativo";
+        if (statusText) {
+          sessionStatus.textContent = sessionId || statusText;
+        }
+      }
+
+      function setFileNameLabel() {
+        const file = fileInput.files && fileInput.files[0];
+        fileName.textContent = file ? file.name : "Nenhum arquivo selecionado";
+      }
+
+      function createCopyButton(text) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "copy-button";
+        button.textContent = "Copiar";
+        button.addEventListener("click", async () => {
+          await navigator.clipboard.writeText(text);
+          button.textContent = "Copiado";
+          button.classList.add("copied");
+          setTimeout(() => {
+            button.textContent = "Copiar";
+            button.classList.remove("copied");
+          }, 1200);
+        });
+        return button;
       }
 
       function appendMessage(role, text) {
-        const lastExchange = chatLog.lastElementChild;
-        let exchange = lastExchange && lastExchange.classList.contains("exchange") ? lastExchange : null;
-        if (!exchange || role === "user" || role === "system") {
-          exchange = document.createElement("div");
-          exchange.className = "exchange";
-          chatLog.appendChild(exchange);
-        }
-
         const node = document.createElement("div");
         node.className = `message ${role}`;
-        const label = role === "user" ? "Você" : role === "bot" ? "Cartographer" : "Sistema";
+
         const header = document.createElement("div");
         header.className = "message-header";
 
-        const labelEl = document.createElement("div");
-        labelEl.className = "message-label";
-        labelEl.textContent = label;
+        const label = document.createElement("div");
+        label.className = "message-label";
+        label.textContent = role === "user" ? "Você" : role === "bot" ? "Cartographer" : "Sistema";
 
-        const copyButton = document.createElement("button");
-        copyButton.type = "button";
-        copyButton.className = "message-copy";
-        copyButton.textContent = "Copiar";
-        copyButton.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(text);
-          copyButton.textContent = "Copiado";
-          copyButton.classList.add("copied");
-          setTimeout(() => {
-            copyButton.textContent = "Copiar";
-            copyButton.classList.remove("copied");
-          }, 1200);
-        });
+        const copyButton = createCopyButton(text);
+        if (role === "system") {
+          copyButton.disabled = true;
+        }
 
-        header.appendChild(labelEl);
+        header.appendChild(label);
         header.appendChild(copyButton);
 
         const body = document.createElement("div");
@@ -289,33 +795,153 @@
 
         node.appendChild(header);
         node.appendChild(body);
-        exchange.appendChild(node);
+        chatLog.appendChild(node);
         chatLog.scrollTop = chatLog.scrollHeight;
+
+        maybeUpdateMapState(text);
+      }
+
+      function renderSidebarList(container, items, kind) {
+        container.innerHTML = "";
+        if (!items.length) {
+          const item = document.createElement("li");
+          item.className = "table-chip empty";
+          item.innerHTML =
+            kind === "explored"
+              ? "<strong>Nenhuma ainda</strong><span>Envie <code>mapa</code> para popular esta lista.</span>"
+              : "<strong>Nenhuma pendência mapeada</strong><span>O grafo ainda não indicou caminhos abertos.</span>";
+          container.appendChild(item);
+          return;
+        }
+
+        items.forEach((entry) => {
+          const item = document.createElement("li");
+          item.className = `table-chip ${kind}`;
+          const title = document.createElement("strong");
+          title.textContent = entry.name;
+          const detail = document.createElement("span");
+          detail.textContent = entry.detail;
+          item.appendChild(title);
+          item.appendChild(detail);
+          container.appendChild(item);
+        });
+      }
+
+      function updateStatusBar() {
+        exploredCount.textContent = String(mapState.explored.length);
+        pendingCount.textContent = String(mapState.pending.length);
+        tableStatus.textContent = `${mapState.explored.length} exploradas / ${mapState.pending.length} pendentes`;
+        graphStatus.textContent = `${mapState.nodeCount} nós`;
+        sessionStatus.textContent = sessionId || "não iniciada";
+      }
+
+      function updateSidebar() {
+        renderSidebarList(exploredList, mapState.explored, "explored");
+        renderSidebarList(pendingList, mapState.pending, "pending");
+        updateStatusBar();
+      }
+
+      function normalizeTableName(raw) {
+        return String(raw || "")
+          .replace(/^[\[\](){}]+|[\[\](){}]+$/g, "")
+          .trim();
+      }
+
+      function parseKnowledgeMap(text) {
+        if (!text.includes("## Mapa do Conhecimento")) {
+          return null;
+        }
+
+        const exploredMap = new Map();
+        const pendingMap = new Map();
+        let nodeCount = 0;
+        let section = "";
+
+        text.split("\n").forEach((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          if (trimmed.startsWith("### Achados")) {
+            section = "findings";
+            return;
+          }
+          if (trimmed.startsWith("### Caminhos não explorados")) {
+            section = "pending";
+            return;
+          }
+
+          if (section === "findings" && trimmed.startsWith("- [")) {
+            const match = trimmed.match(/^- \[([^\]]+)\] (.+)$/);
+            if (!match) return;
+            nodeCount += 1;
+            const unit = normalizeTableName(match[1]);
+            if (!unit || unit === "resultado") return;
+            if (!exploredMap.has(unit)) {
+              exploredMap.set(unit, { name: unit, detail: match[2].trim() });
+            }
+            return;
+          }
+
+          if (section === "pending" && trimmed.startsWith("- ")) {
+            const match = trimmed.match(/^- ([^:]+): (.+)$/);
+            if (!match) return;
+            const unit = normalizeTableName(match[1]);
+            if (!unit) return;
+            pendingMap.set(unit, { name: unit, detail: match[2].trim() });
+          }
+        });
+
+        exploredMap.forEach((_, unit) => {
+          pendingMap.delete(unit);
+        });
+
+        return {
+          explored: Array.from(exploredMap.values()),
+          pending: Array.from(pendingMap.values()),
+          nodeCount,
+        };
+      }
+
+      function maybeUpdateMapState(text) {
+        const shouldParse = lastUserMessage.toLowerCase() === "mapa" || text.includes("## Mapa do Conhecimento");
+        if (!shouldParse) return;
+        const parsed = parseKnowledgeMap(text);
+        if (!parsed) return;
+        mapState = parsed;
+        updateSidebar();
       }
 
       async function uploadFile() {
-        const file = fileInput.files[0];
+        const file = fileInput.files && fileInput.files[0];
         if (!file) {
           appendMessage("system", "Escolha um arquivo antes do upload.");
           return;
         }
+
         const form = new FormData();
         form.append("file", file);
-        setBusy(true, "Enviando arquivo...");
+
+        setBusy(true, "Enviando arquivo");
         try {
           const response = await fetch("/upload", { method: "POST", body: form });
           const payload = await response.json();
           if (!response.ok) {
             throw new Error(payload.detail || "Falha no upload.");
           }
+
           sessionId = payload.session_id;
+          lastUserMessage = "";
+          mapState = { explored: [], pending: [], nodeCount: 0 };
           chatLog.innerHTML = "";
           appendMessage("system", `Sessão iniciada: ${sessionId}`);
           appendMessage("bot", payload.response);
-          setBusy(false, `Arquivo carregado. Sessão ${sessionId}.`);
+          updateSidebar();
+          setBusy(false, "Arquivo carregado");
+          serverStatus.textContent = "Ativo";
+          sessionStatus.textContent = sessionId;
         } catch (error) {
           appendMessage("system", `Erro no upload: ${error.message}`);
-          setBusy(false, "Falha no upload.");
+          setBusy(false, "Falha no upload");
+          serverStatus.textContent = "Falha";
         }
       }
 
@@ -323,29 +949,38 @@
         event.preventDefault();
         const message = messageInput.value.trim();
         if (!message || !sessionId) return;
+
+        lastUserMessage = message;
         appendMessage("user", message);
         messageInput.value = "";
-        setBusy(true, "Processando mensagem...");
+        setBusy(true, "Processando mensagem");
+
         try {
           const response = await fetch("/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: sessionId, message })
+            body: JSON.stringify({ session_id: sessionId, message }),
           });
           const payload = await response.json();
           if (!response.ok) {
             throw new Error(payload.detail || "Falha no chat.");
           }
+
           appendMessage("bot", payload.response);
-          setBusy(false, `Sessão ativa: ${sessionId}`);
+          setBusy(false, "Sessão ativa");
+          serverStatus.textContent = "Ativo";
         } catch (error) {
           appendMessage("system", `Erro no chat: ${error.message}`);
-          setBusy(false, "Falha no chat.");
+          setBusy(false, "Falha no chat");
+          serverStatus.textContent = "Falha";
         }
       }
 
+      fileInput.addEventListener("change", setFileNameLabel);
       uploadButton.addEventListener("click", uploadFile);
       chatForm.addEventListener("submit", sendMessage);
+      updateSidebar();
+      updateStatusBar();
     </script>
   </body>
 </html>

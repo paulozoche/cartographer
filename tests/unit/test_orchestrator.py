@@ -509,8 +509,15 @@ def test_orchestrate_system_prompt_forbids_done_on_error() -> None:
     assert "LEI 2 — CATÁLOGO É EXATO, NÃO APROXIMADO" in captured["system_prompt"]
     assert "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO" in captured["system_prompt"]
     assert "LEI 4 — ERRO NÃO É CONCLUSÃO" in captured["system_prompt"]
-    assert "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA" in captured["system_prompt"]
+    assert "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA E NÃO PARALISA" in captured["system_prompt"]
+    assert 'executar a ação sugerida' in captured["system_prompt"]
+    assert 'Histórico mostra Interface sugerindo: "Quer que eu explore crime_scene_report?"' in captured["system_prompt"]
+    assert 'Resposta CORRETA: {"action": "analyze_unit", "unit_name": "crime_scene_report"}' in captured["system_prompt"]
+    assert 'Resposta ERRADA: {"action": "tables"}' in captured["system_prompt"]
+    assert 'Resposta ERRADA: {"action": "done", "conclusion": "..."}' in captured["system_prompt"]
+    assert 'Nunca responder com "preciso de instrução clara"' in captured["system_prompt"]
     assert "LEI 6 — NÃO REEXECUTE" in captured["system_prompt"]
+    assert "NÃO execute novamente a mesma query sobre X" in captured["system_prompt"]
 
 
 def test_interface_prompt_forbids_calculation_and_promises() -> None:
@@ -797,6 +804,25 @@ def test_update_knowledge_graph_adds_edge_from_curator() -> None:
     edge = session.knowledge_graph.edges[0]
     assert edge.from_id == "events:1"
     assert edge.relation == "aprofunda"
+
+
+def test_update_knowledge_graph_does_not_add_duplicate_node() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.knowledge_graph = orchestrator.KnowledgeGraph()
+    session.analysis_by_unit = {}
+    session.units = []
+
+    class QuietCurator:
+        def send(self, prompt: str, *, system_prompt: str | None = None):
+            return type("Response", (), {"content": '{"from_id":"","relation":""}'})()
+
+    session.curator_ai = QuietCurator()
+
+    payload = {"unit_name": "events", "summary": "Tabela events com 10 linhas.", "metrics_summary": []}
+    session.update_knowledge_graph(payload, action="analyze_unit")
+    session.update_knowledge_graph(payload, action="analyze_unit")
+
+    assert len(session.knowledge_graph.nodes) == 1
 
 
 def test_render_knowledge_map_lists_findings_and_unexplored_units() -> None:
