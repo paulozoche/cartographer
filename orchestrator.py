@@ -164,6 +164,21 @@ class KnowledgeGraph:
     nodes: list[KnowledgeNode] = field(default_factory=list)
     edges: list[KnowledgeEdge] = field(default_factory=list)
 
+    def to_context(self) -> str:
+        lines = ["## Grafo de Conhecimento", "", "### Nós"]
+        if not self.nodes:
+            lines.append("- Nenhum nó registrado.")
+        else:
+            for node in self.nodes:
+                lines.append(f"- {node.id} [{node.unit}]: {node.label}")
+        lines.extend(["", "### Arestas"])
+        if not self.edges:
+            lines.append("- Nenhuma aresta registrada.")
+        else:
+            for edge in self.edges:
+                lines.append(f"- {edge.from_id} -> {edge.relation} -> {edge.to_id}")
+        return "\n".join(lines)
+
 
 class DeepSeekClient:
     def __init__(
@@ -354,6 +369,10 @@ class OrchestratorSession:
     def curated_context_for(self, user_text: str, *, is_first_call: bool) -> str:
         if not self.should_use_curator(is_first_call=is_first_call):
             return self._full_structural_context or self.build_compact_structural_context()
+        graph = getattr(self, "knowledge_graph", None)
+        curator_context = self._full_structural_context or self.build_compact_structural_context()
+        if graph is not None and len(graph.nodes) >= 2:
+            curator_context = graph.to_context()
         cache_key = user_text.strip()
         cached = self._curator_cache.get(cache_key)
         if cached is not None:
@@ -371,7 +390,7 @@ class OrchestratorSession:
         prompt = build_curator_prompt(
             user_message=user_text,
             available_units=[unit.unit_name for unit in self.units],
-            full_context=self._full_structural_context or "",
+            full_context=curator_context,
         )
         try:
             response = self.curator_ai.send(prompt, system_prompt=system_prompt)
@@ -582,6 +601,10 @@ class OrchestratorSession:
 
         node = self._knowledge_node_from_result(result, action=action)
         graph.nodes.append(node)
+        heuristic_edge = self._heuristic_knowledge_edge(node)
+        if heuristic_edge is not None:
+            graph.edges.append(heuristic_edge)
+            return
         edge = self._curate_knowledge_edge(node)
         if edge is not None:
             graph.edges.append(edge)
@@ -755,6 +778,29 @@ class OrchestratorSession:
             return None
         return KnowledgeEdge(from_id=from_id.strip(), to_id=new_node.id, relation=relation.strip())
 
+    def _heuristic_knowledge_edge(self, new_node: KnowledgeNode) -> KnowledgeEdge | None:
+        if not new_node.unit.strip():
+            return None
+        existing_nodes = getattr(self.knowledge_graph, "nodes", [])[:-1]
+        new_node_kind = self._knowledge_node_kind(new_node)
+        if new_node_kind != "query":
+            return None
+        for existing_node in existing_nodes:
+            if existing_node.unit != new_node.unit:
+                continue
+            if self._knowledge_node_kind(existing_node) != "unit":
+                continue
+            return KnowledgeEdge(from_id=existing_node.id, to_id=new_node.id, relation="aprofunda")
+        return None
+
+    def _knowledge_node_kind(self, node: KnowledgeNode) -> str:
+        data = node.data if isinstance(node.data, dict) else {}
+        if "unit_name" in data:
+            return "unit"
+        if "query_id" in data or "template_id" in data:
+            return "query"
+        return "unknown"
+
     def _schema_for_table(self, table_name: str) -> dict[str, object]:
         unit = next((item for item in self.units if item.unit_name == table_name), None)
         if unit is None:
@@ -872,7 +918,7 @@ def build_interface_prompt(
     payload = {
         "source_path": source_path,
         "source_type": source_type,
-        "history": history[-6:],
+        "history": history[-3:],
         "is_first_call": is_first_call,
         "structural_context": structural_context,
         "user_message": user_text,
@@ -901,7 +947,7 @@ def build_orchestrator_prompt(
         "source_path": source_path,
         "source_type": source_type,
         "unit_names": unit_names,
-        "history": history[-6:],
+        "history": history[-3:],
         "is_first_call": is_first_call,
         "attempt_number": attempt_number,
         "user_message": user_text,

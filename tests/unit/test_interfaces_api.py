@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from agnostic.ai.ports.ai_orchestrator import AIResponse
-from agnostic.infrastructure.ai.grok_client import GroqAPIError
+from agnostic.infrastructure.ai.grok_client import GroqAPIError, SimulatedGrokClient
 from agnostic.interfaces.api.dependencies import get_ai_client
 from agnostic.interfaces.api import create_app
 from agnostic.interfaces.api.app import _bounded_json_preview
@@ -21,33 +21,18 @@ def test_health_route_returns_ok() -> None:
 
 
 def test_root_route_returns_visual_interface() -> None:
-    pytest.skip("Interface visual baseada em cards foi desativada em favor do chat no terminal.")
     client = TestClient(create_app())
 
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "Analisador de Dados Agnóstico" in response.text
-    assert "Resumo da origem" in response.text
-    assert "Unidade anterior" in response.text
-    assert "Próxima unidade" in response.text
-    assert "Copiar quadro" in response.text
-    assert "Resumo humano" in response.text
-    assert "Payload bruto" in response.text
-    assert "Ativar modo foco" in response.text or "Desativar modo foco" in response.text
-    assert "Setup essencial" in response.text
-    assert "Painel de Ferramentas" in response.text
-    assert "Painel de Orientação" in response.text
-    assert "Tabelas da origem" in response.text
-    assert "Árvore de recortes" in response.text
-    assert "Nenhuma unidade carregada ainda." in response.text
-    assert "Trilha de exploração: ainda vazia." in response.text
-    assert "Baixar resumo" in response.text
-    assert "Execute uma análise detalhada para habilitar o download." in response.text
+    assert "Cartographer" in response.text
+    assert "A interface visual baseada em cards foi desativada." in response.text
+    assert "python chat.py" in response.text
+    assert "rotas estruturadas da API permanecem disponíveis" in response.text
 
 
 def test_root_route_summary_shows_origin_overview_and_table_previews(monkeypatch, tmp_path: Path) -> None:
-    pytest.skip("Interface visual baseada em cards foi desativada em favor do chat no terminal.")
     monkeypatch.setenv(
         "AGNOSTIC_DATA_ANALYSER_RESULTS_DIR",
         str(tmp_path / "results"),
@@ -72,24 +57,15 @@ def test_root_route_summary_shows_origin_overview_and_table_previews(monkeypatch
     )
 
     assert response.status_code == 200
-    assert "Contexto de origem" in response.text
-    assert "Estrutura analítica" in response.text
-    assert "Banco: sample.csv" in response.text
-    assert "tabelas detectadas" in response.text
-    assert "Melhores pistas:" in response.text
-    assert "Pista principal:" in response.text
-    assert "sample.csv" in response.text
-    assert "prioridade" in response.text
-    assert "Resumo das colunas mais relevantes:" in response.text
-    assert "event_id:" in response.text
-    assert "sample.csv: 2 linhas, 2 colunas." in response.text
-    assert "Árvore de recortes" in response.text
-    assert "Detalhes técnicos (oculto)" in response.text
-    assert "As métricas por unidade aparecem após a análise detalhada." not in response.text
+    assert "Cartographer" in response.text
+    assert "A interface visual baseada em cards foi desativada." in response.text
+    assert "python chat.py" in response.text
 
 
 def test_ai_consult_route_returns_simulated_response() -> None:
-    client = TestClient(create_app())
+    app = create_app()
+    app.dependency_overrides[get_ai_client] = lambda: SimulatedGrokClient()
+    client = TestClient(app)
 
     response = client.post(
         "/ai/consult",
@@ -154,7 +130,7 @@ def test_tabular_analysis_route_returns_structured_result(monkeypatch, tmp_path:
     assert "summary" in data
     assert "Unidade events" in data["summary"]
     assert data["persisted_to"].endswith("events.json")
-    assert data["unit_name"] == "events"
+    assert data["tabela_nome"] == "events"
     assert data["standardized"]["row_count"] == 3
     assert data["standardized"]["column_order"] == ["event_id", "category"]
     assert set(data["columns"]) == {"event_id", "category"}
@@ -243,19 +219,19 @@ def test_source_inspection_route_uses_real_datasource(monkeypatch, tmp_path: Pat
 
     assert response.status_code == 200
     data = response.json()
-    assert data["unit_names"] == ["sample.csv"]
+    assert data["tabela_nomes"] == ["sample.csv"]
     assert "summary" in data
     assert "sample.csv" in data["summary"]
     assert "Unidade em foco: sample.csv" in data["summary"]
     assert data["persisted_to"].endswith("sample.csv.json")
-    assert data["source"]["display_name"] == "sample.csv"
-    assert data["source"]["unit_count"] == 1
-    assert len(data["units"]) == 1
-    assert data["units"][0]["unit_name"] == "sample.csv"
-    assert data["units"][0]["metrics_summary"]
-    assert "linhas" in data["units"][0]["metrics_summary"][0]
-    assert data["units"][0]["persisted_to"].endswith("sample.csv.json")
-    for column_payload in data["units"][0]["columns"].values():
+    assert data["origem"]["display_name"] == "sample.csv"
+    assert data["origem"]["unit_count"] == 1
+    assert len(data["tabelas"]) == 1
+    assert data["tabelas"][0]["tabela_nome"] == "sample.csv"
+    assert data["tabelas"][0]["metrics_summary"]
+    assert "linhas" in data["tabelas"][0]["metrics_summary"][0]
+    assert data["tabelas"][0]["persisted_to"].endswith("sample.csv.json")
+    for column_payload in data["tabelas"][0]["columns"].values():
         recortes = column_payload.get("recortes_internos", [])
         assert len(recortes) <= 5
         for recorte in recortes:
@@ -294,10 +270,10 @@ def test_source_inspection_route_can_filter_selected_unit(monkeypatch, tmp_path:
 
     assert response.status_code == 200
     data = response.json()
-    assert data["unit_names"] == ["sample.csv"]
-    assert len(data["units"]) == 1
-    assert data["units"][0]["unit_name"] == "sample.csv"
-    assert data["unit_previews"][0]["description"].startswith("Unidade sample.csv:")
+    assert data["tabela_nomes"] == ["sample.csv"]
+    assert len(data["tabelas"]) == 1
+    assert data["tabelas"][0]["tabela_nome"] == "sample.csv"
+    assert data["tabela_previas"][0]["description"].startswith("Unidade sample.csv:")
     assert "Unidade selecionada: sample.csv" in data["summary"]
     assert data["persisted_to"].endswith("sample.csv.json")
     assert Path(data["persisted_to"]).exists()
@@ -329,19 +305,9 @@ def test_root_route_detail_mode_shows_focused_unit_panel(monkeypatch, tmp_path: 
     )
 
     assert response.status_code == 200
-    assert "Contexto da tabela" in response.text
-    assert "Tabela em foco" in response.text
-    assert "Estrutura analítica" in response.text
-    assert "Detalhe" in response.text
-    assert "focus-columns" in response.text
-    assert "Métricas calculadas da tabela" in response.text
-    assert "Detalhes técnicos (oculto)" in response.text
-    assert "Layer 1" not in response.text
-    assert "Layer 2" not in response.text
-    assert "Colunas disponíveis nesta tabela." in response.text
-    assert "Explore as colunas sem sair da tabela atual." in response.text
-    assert "Árvore de recortes" in response.text
-    assert "Voltar à origem" in response.text
+    assert "Cartographer" in response.text
+    assert "A interface visual baseada em cards foi desativada." in response.text
+    assert "python chat.py" in response.text
 
 
 def test_root_route_detail_mode_shows_action_controls_on_left(monkeypatch, tmp_path: Path) -> None:
@@ -370,11 +336,8 @@ def test_root_route_detail_mode_shows_action_controls_on_left(monkeypatch, tmp_p
     )
 
     assert response.status_code == 200
-    assert "Setup essencial" in response.text
-    assert "Resumo da origem" in response.text
-    assert "Explorar rápido" not in response.text
-    assert "Analisar unidade" not in response.text
-    assert "Limpar estado salvo" not in response.text
+    assert "Cartographer" in response.text
+    assert "A interface visual baseada em cards foi desativada." in response.text
 
 
 def test_root_route_column_mode_shows_focused_column_panel(monkeypatch, tmp_path: Path) -> None:
@@ -404,24 +367,8 @@ def test_root_route_column_mode_shows_focused_column_panel(monkeypatch, tmp_path
     )
 
     assert response.status_code == 200
-    assert "Contexto da coluna" in response.text
-    assert "Estrutura analítica" in response.text
-    assert "Sinais" in response.text
-    assert "Capacidades" in response.text
-    assert "Perfil dominante" in response.text
-    assert "Cards" in response.text
-    assert "Recortes internos relevantes" in response.text
-    assert "Caminhos" in response.text
-    assert "Amostra da coluna" in response.text
-    assert "Contexto do valor / célula" in response.text
-    assert "Estrutura analítica" in response.text
-    assert "Detalhes técnicos (oculto)" in response.text
-    assert "Layer 1" not in response.text
-    assert "Layer 2" not in response.text
-    assert "Recortes internos relevantes desta coluna." in response.text
-    assert "Escolha o recorte mais informativo para avançar." in response.text
-    assert "Árvore de recortes" in response.text
-    assert "Voltar à tabela" in response.text
+    assert "Cartographer" in response.text
+    assert "A interface visual baseada em cards foi desativada." in response.text
 
 
 def test_source_inspection_route_returns_clear_error_for_missing_file() -> None:

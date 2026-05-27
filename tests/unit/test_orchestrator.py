@@ -109,6 +109,29 @@ def test_build_interface_prompt_includes_first_call_flag() -> None:
     assert '"structural_context": "contexto completo"' in prompt
 
 
+def test_build_interface_prompt_limits_history_to_last_three_items() -> None:
+    prompt = orchestrator.build_interface_prompt(
+        source_path="/tmp/sample.db",
+        source_type="sqlite",
+        history=[
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "2"},
+            {"role": "user", "content": "3"},
+            {"role": "assistant", "content": "4"},
+        ],
+        user_text="oi",
+        result_context="resultado",
+        structural_context="contexto completo",
+        is_first_call=False,
+    )
+    payload = orchestrator.json.loads(prompt)
+    assert payload["history"] == [
+        {"role": "assistant", "content": "2"},
+        {"role": "user", "content": "3"},
+        {"role": "assistant", "content": "4"},
+    ]
+
+
 def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> None:
     prompt = orchestrator.build_orchestrator_prompt(
         source_path="/tmp/sample.db",
@@ -131,6 +154,35 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
     assert '"query_catalog": [' in prompt
     assert '"analytic_templates": [' in prompt
     assert '"action": "analyze_unit"' in prompt
+
+
+def test_build_orchestrator_prompt_limits_history_to_last_three_items() -> None:
+    prompt = orchestrator.build_orchestrator_prompt(
+        source_path="/tmp/sample.db",
+        source_type="sqlite",
+        unit_names=["events"],
+        structural_context="contexto completo",
+        history=[
+            {"role": "user", "content": "1"},
+            {"role": "assistant", "content": "2"},
+            {"role": "user", "content": "3"},
+            {"role": "assistant", "content": "4"},
+        ],
+        user_text="listar tabelas",
+        compact_structural_context="events: 10 linhas",
+        is_first_call=False,
+        last_error="",
+        last_result="",
+        executed_queries=[],
+        query_catalog=["knot_type_distribution"],
+        attempt_number=1,
+    )
+    payload = orchestrator.json.loads(prompt)
+    assert payload["history"] == [
+        {"role": "assistant", "content": "2"},
+        {"role": "user", "content": "3"},
+        {"role": "assistant", "content": "4"},
+    ]
 
 
 def test_compress_assistant_message_limits_size() -> None:
@@ -316,6 +368,64 @@ def test_curated_context_for_falls_back_to_full_context_on_failure() -> None:
     session.curator_ai = FailingCurator()
     result = session.curated_context_for("pergunta", is_first_call=False)
     assert result == "contexto completo"
+
+
+def test_curated_context_for_uses_knowledge_graph_context_when_available() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [
+        type("Unit", (), {"unit_name": "a"})(),
+        type("Unit", (), {"unit_name": "b"})(),
+        type("Unit", (), {"unit_name": "c"})(),
+        type("Unit", (), {"unit_name": "d"})(),
+    ]
+    session._full_structural_context = "contexto completo"
+    session._curator_cache = {}
+    session.knowledge_graph = orchestrator.KnowledgeGraph(
+        nodes=[
+            orchestrator.KnowledgeNode(
+                id="events:1",
+                label="Tabela events com 10 linhas.",
+                unit="events",
+                data={"unit_name": "events"},
+                timestamp="2026-05-26T00:00:00+00:00",
+            ),
+            orchestrator.KnowledgeNode(
+                id="events:2",
+                label="events_by_type: 3 linhas na prévia",
+                unit="events",
+                data={"query_id": "events_by_type"},
+                timestamp="2026-05-26T00:01:00+00:00",
+            ),
+        ],
+        edges=[
+            orchestrator.KnowledgeEdge(
+                from_id="events:1",
+                to_id="events:2",
+                relation="aprofunda",
+            )
+        ],
+    )
+
+    class InspectingCurator:
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        def send(self, prompt: str, *, system_prompt: str | None = None):
+            self.prompt = prompt
+            return type(
+                "Response",
+                (),
+                {"content": '{"relevant_units":["events"],"curated_context":"contexto curado"}'},
+            )()
+
+    curator = InspectingCurator()
+    session.curator_ai = curator
+
+    result = session.curated_context_for("pergunta", is_first_call=False)
+
+    assert result == "contexto curado"
+    assert "## Grafo de Conhecimento" in curator.prompt
+    assert "contexto completo" not in curator.prompt
 
 
 def test_build_structural_context_flags_empty_units() -> None:
