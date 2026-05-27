@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -29,6 +30,9 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 REQUEST_TIMEOUT_SECONDS = 60.0
+UPLOAD_TIMEOUT_SECONDS = 300.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,10 +78,12 @@ async def upload(file: UploadFile = File(...)) -> ChatResponse:
     try:
         session_id, opening = await asyncio.wait_for(
             asyncio.to_thread(_create_session, temp_path),
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=UPLOAD_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.exception("Upload failed for file %s", file.filename)
+        detail = str(exc).strip() or exc.__class__.__name__ or "Erro desconhecido no upload."
+        raise HTTPException(status_code=400, detail=detail) from exc
 
     return ChatResponse(response=opening, session_id=session_id)
 

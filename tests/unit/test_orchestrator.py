@@ -17,6 +17,13 @@ def test_parse_orchestrator_json_accepts_tables_action() -> None:
     assert orchestrator.parse_orchestrator_json('{"action":"tables"}') == {"action": "tables"}
 
 
+def test_parse_orchestrator_json_accepts_analyze_unit_action() -> None:
+    assert orchestrator.parse_orchestrator_json('{"action":"analyze_unit","unit_name":"events"}') == {
+        "action": "analyze_unit",
+        "unit_name": "events",
+    }
+
+
 def test_parse_orchestrator_json_accepts_schema_action() -> None:
     payload = orchestrator.parse_orchestrator_json('{"action":"schema","table":"events"}')
     assert payload == {"action": "schema", "table": "events"}
@@ -121,6 +128,7 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
     assert "contexto completo" not in prompt
     assert '"query_catalog": [' in prompt
     assert '"analytic_templates": [' in prompt
+    assert '"action": "analyze_unit"' in prompt
 
 
 def test_compress_assistant_message_limits_size() -> None:
@@ -215,6 +223,68 @@ def test_should_use_curator_only_after_first_call_and_with_more_than_three_units
     session._full_structural_context = "contexto"
     assert session.should_use_curator(is_first_call=False) is True
     assert session.should_use_curator(is_first_call=True) is False
+
+
+def test_build_source_overview_context_returns_metadata_only() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.source_path = "/tmp/sample.db"
+    session.source_type = "sqlite"
+    session.units = [
+        type(
+            "Unit",
+            (),
+            {
+                "unit_name": "events",
+                "get_metadata": lambda self: type("Meta", (), {"row_count": 3})(),
+                "get_structure": lambda self: type(
+                    "Structure",
+                    (),
+                    {"columns": (type("Column", (), {"name": "id"})(), type("Column", (), {"name": "name"})())},
+                )(),
+            },
+        )()
+    ]
+
+    context = session.build_source_overview_context()
+    assert "Layer 1 — descoberta inicial" in context
+    assert "Unidade events: 3 linhas; colunas: id, name." in context
+
+
+def test_analyze_unit_on_demand_uses_cache(monkeypatch) -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [type("Unit", (), {"unit_name": "events"})()]
+    session.analysis_by_unit = {}
+    session.explored_paths = []
+
+    calls = {"count": 0}
+
+    monkeypatch.setattr(orchestrator, "load_app_config", lambda: type("Cfg", (), {"analysis": type("A", (), {"max_rows_per_unit": 10})()})())
+
+    def fake_analyze(unit, max_rows=None):
+        calls["count"] += 1
+        return {"unit": unit.unit_name, "max_rows": max_rows}
+
+    monkeypatch.setattr(orchestrator, "analyze_tabular_unit", fake_analyze)
+
+    first = session.analyze_unit_on_demand("events")
+    second = session.analyze_unit_on_demand("events")
+
+    assert first == second
+    assert calls["count"] == 1
+    assert session.explored_paths == ["events"]
+
+
+def test_execute_action_analyze_unit_returns_summary(monkeypatch) -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.explored_paths = ["events"]
+    session.analyze_unit_on_demand = lambda unit_name: {"unit_name": unit_name}
+    monkeypatch.setattr(orchestrator, "summarize_tabular_analysis", lambda analysis: "Resumo da unidade.")
+    monkeypatch.setattr(orchestrator, "summarize_unit_metrics", lambda analysis: ["3 linhas", "2 colunas"])
+
+    payload = orchestrator.json.loads(session.execute_action({"action": "analyze_unit", "unit_name": "events"}))
+    assert payload["unit_name"] == "events"
+    assert payload["summary"] == "Resumo da unidade."
+    assert payload["metrics_summary"] == ["3 linhas", "2 colunas"]
 
 
 def test_curated_context_for_falls_back_to_full_context_on_failure() -> None:

@@ -228,6 +228,7 @@ class OrchestratorSession:
         if not self.units:
             raise ValueError("Nenhuma unidade tabular foi encontrada na origem informada.")
         self.analysis_by_unit: dict[str, object] = {}
+        self.explored_paths: list[str] = []
         self.history: list[dict[str, str]] = []
         self._full_structural_context: str | None = None
         self._curator_cache: dict[str, dict[str, object]] = {}
@@ -245,8 +246,7 @@ class OrchestratorSession:
         )
 
     def bootstrap(self) -> tuple[str, str]:
-        analyses = self.analyze_all_units()
-        structural_context = self.build_structural_context(analyses)
+        structural_context = self.build_source_overview_context()
         self._full_structural_context = structural_context
         opening = self.interface_reply(
             "Explique o panorama inicial em linguagem humana e sugira o próximo passo de exploração.",
@@ -255,16 +255,45 @@ class OrchestratorSession:
         )
         return structural_context, opening
 
-    def analyze_all_units(self) -> list[object]:
-        analyses: list[object] = []
-        max_rows = load_app_config().analysis.max_rows_per_unit
+    def build_source_overview_context(self) -> str:
+        sections = [
+            f"Origem: {self.source_path}",
+            f"Tipo detectado: {self.source_type}",
+            f"Unidades detectadas: {', '.join(unit.unit_name for unit in self.units)}",
+            "Layer 1 — descoberta inicial: metadata básica por unidade, sem análise profunda.",
+        ]
         for unit in self.units:
-            analysis = self.analysis_by_unit.get(unit.unit_name)
-            if analysis is None:
-                analysis = analyze_tabular_unit(unit, max_rows=max_rows)
-                self.analysis_by_unit[unit.unit_name] = analysis
-            analyses.append(analysis)
-        return analyses
+            metadata = unit.get_metadata()
+            structure = unit.get_structure()
+            row_count = metadata.row_count if metadata.row_count is not None else "desconhecida"
+            column_names = ", ".join(column.name for column in structure.columns) or "sem colunas"
+            sections.append(
+                f"Unidade {unit.unit_name}: {row_count} linhas; colunas: {column_names}."
+            )
+            if metadata.row_count == 0:
+                sections.append(
+                    f"ALERTA: a unidade {unit.unit_name} está vazia (0 linhas). "
+                    "Consultas sobre ela não retornarão dados até haver conteúdo."
+                )
+        return "\n\n".join(sections)
+
+    def analyze_unit_on_demand(self, unit_name: str) -> object:
+        cached = self.analysis_by_unit.get(unit_name)
+        if cached is not None:
+            if unit_name not in self.explored_paths:
+                self.explored_paths.append(unit_name)
+            return cached
+
+        unit = next((item for item in self.units if item.unit_name == unit_name), None)
+        if unit is None:
+            raise ValueError(f"Unidade não encontrada: {unit_name}")
+
+        max_rows = load_app_config().analysis.max_rows_per_unit
+        analysis = analyze_tabular_unit(unit, max_rows=max_rows)
+        self.analysis_by_unit[unit_name] = analysis
+        if unit_name not in self.explored_paths:
+            self.explored_paths.append(unit_name)
+        return analysis
 
     def build_structural_context(self, analyses: list[object]) -> str:
         sections = [
@@ -390,6 +419,7 @@ class OrchestratorSession:
             "LEIS (em ordem de prioridade — lei superior prevalece):\n\n"
             "LEI 1 — FORMATO ABSOLUTO:\n"
             "Toda resposta deve ser exatamente um destes JSONs:\n"
+            '  {"action":"analyze_unit","unit_name":"nome_da_tabela"}\n'
             '  {"action":"query","query_id":"id_do_catalogo"}\n'
             '  {"action":"template","template_id":"group_feature_signature","params":{"group_expr":"...","feature_expr":"...","from_clause":"...","where_clause":"...","subfeature_expr":"","subfeature_group":""}}\n'
             '  {"action":"request_new_query","description":"o que precisa","suggested_sql":"SELECT ..."}\n'
@@ -423,6 +453,9 @@ class OrchestratorSession:
             "LEI 6 — NÃO REEXECUTE:\n"
             "Se já existe resultado válido no turno atual, não reexecute o mesmo query_id.\n"
             "Use o resultado existente para decidir o próximo passo.\n"
+            'Quando o usuário quiser aprofundar uma tabela específica, use:\n{"action":"analyze_unit","unit_name":"nome_da_tabela"}\n'
+            "Só analise tabelas que o usuário pediu explicitamente.\n"
+            "Não analise todas as tabelas de uma vez.\n"
             "Quando o usuário pedir padrões, assinaturas ou diferenças por grupo:\n"
             "- Use action=template com template_id=group_feature_signature\n"
             "- Identifique: grupo, atributo, joins necessários, filtros de limpeza\n"
@@ -431,6 +464,18 @@ class OrchestratorSession:
             "- Nunca deduza exclusividade de preview ou amostra parcial\n"
             "Para validar se padrão vem de múltiplos objetos:\n"
             "- Use action=template com template_id=group_feature_signature_by_entity\n"
+            "COMO INSTANCIAR TEMPLATES:\n"
+            "1. Leia o contexto estrutural disponível para identificar:\n"
+            "- quais tabelas existem\n"
+            "- quais colunas cada tabela tem\n"
+            "- como as tabelas se relacionam (colunas com mesmo nome ou alta cardinalidade)\n"
+            "2. Para group_feature_signature:\n"
+            "- group_expr: coluna de agrupamento (ex: categoria, região, país)\n"
+            "- feature_expr: coluna de atributo a analisar (ex: tipo, código, status)\n"
+            "- from_clause: tabelas e JOINs necessários baseados no schema real\n"
+            "- where_clause: filtros para remover nulos e valores vazios das colunas usadas\n"
+            "3. Nunca invente nomes de colunas. Use apenas colunas que existem no schema.\n"
+            "4. Se não conseguir montar os parâmetros com certeza, use action=schema para consultar a tabela antes de instanciar o template.\n"
         )
         prompt = build_orchestrator_prompt(
             source_path=self.source_path,
@@ -460,6 +505,21 @@ class OrchestratorSession:
                 },
                 ensure_ascii=False,
                 indent=2,
+            )
+        if action == "analyze_unit":
+            unit_name = str(action_payload["unit_name"])
+            analysis = self.analyze_unit_on_demand(unit_name)
+            return json.dumps(
+                {
+                    "unit_name": unit_name,
+                    "summary": summarize_tabular_analysis(analysis),
+                    "metrics_summary": summarize_unit_metrics(analysis),
+                    "cached": True,
+                    "explored_paths": list(self.explored_paths),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
             )
         if action == "schema":
             table = str(action_payload["table"])
@@ -644,6 +704,7 @@ def build_orchestrator_prompt(
         "query_catalog": query_catalog or sorted(set(QUERY_CATALOG.keys())),
         "analytic_templates": sorted(ANALYTIC_TEMPLATES.keys()),
         "allowed_actions": [
+            {"action": "analyze_unit", "unit_name": "nome_da_tabela"},
             {"action": "query", "query_id": "knot_type_distribution"},
             {
                 "action": "template",
@@ -690,6 +751,11 @@ def parse_orchestrator_json(raw_content: str) -> dict[str, object]:
     action = payload.get("action")
     if action == "tables":
         return {"action": "tables"}
+    if action == "analyze_unit":
+        unit_name = payload.get("unit_name")
+        if not isinstance(unit_name, str) or not unit_name.strip():
+            raise ValueError("Ação analyze_unit exige o campo 'unit_name'.")
+        return {"action": "analyze_unit", "unit_name": unit_name.strip()}
     if action == "schema":
         table = payload.get("table")
         if not isinstance(table, str) or not table.strip():
