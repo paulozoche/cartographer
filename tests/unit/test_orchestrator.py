@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sqlite3
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -10,6 +11,7 @@ MODULE_PATH = ROOT / "orchestrator.py"
 SPEC = importlib.util.spec_from_file_location("orchestrator_module", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 orchestrator = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = orchestrator
 SPEC.loader.exec_module(orchestrator)
 
 
@@ -277,6 +279,13 @@ def test_analyze_unit_on_demand_uses_cache(monkeypatch) -> None:
 def test_execute_action_analyze_unit_returns_summary(monkeypatch) -> None:
     session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
     session.explored_paths = ["events"]
+    session.knowledge_graph = orchestrator.KnowledgeGraph()
+
+    class QuietCurator:
+        def send(self, prompt: str, *, system_prompt: str | None = None):
+            return type("Response", (), {"content": '{"from_id":"","relation":""}'})()
+
+    session.curator_ai = QuietCurator()
     session.analyze_unit_on_demand = lambda unit_name: {"unit_name": unit_name}
     monkeypatch.setattr(orchestrator, "summarize_tabular_analysis", lambda analysis: "Resumo da unidade.")
     monkeypatch.setattr(orchestrator, "summarize_unit_metrics", lambda analysis: ["3 linhas", "2 colunas"])
@@ -285,6 +294,8 @@ def test_execute_action_analyze_unit_returns_summary(monkeypatch) -> None:
     assert payload["unit_name"] == "events"
     assert payload["summary"] == "Resumo da unidade."
     assert payload["metrics_summary"] == ["3 linhas", "2 colunas"]
+    assert len(session.knowledge_graph.nodes) == 1
+    assert session.knowledge_graph.nodes[0].unit == "events"
 
 
 def test_curated_context_for_falls_back_to_full_context_on_failure() -> None:
@@ -649,3 +660,81 @@ def test_session_query_does_not_modify_fixed_catalog(tmp_path) -> None:
     )
 
     assert orchestrator.QUERY_CATALOG == original_catalog
+
+
+def test_update_knowledge_graph_adds_edge_from_curator() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.knowledge_graph = orchestrator.KnowledgeGraph()
+    session.analysis_by_unit = {}
+    session.units = []
+
+    class LinkingCurator:
+        def send(self, prompt: str, *, system_prompt: str | None = None):
+            return type("Response", (), {"content": '{"from_id":"events:1","relation":"aprofunda"}'})()
+
+    session.curator_ai = LinkingCurator()
+    session.update_knowledge_graph(
+        {"unit_name": "events", "summary": "Tabela events com 10 linhas.", "metrics_summary": []},
+        action="analyze_unit",
+    )
+    session.update_knowledge_graph(
+        {"query_id": "events_by_type", "sql": "SELECT * FROM events", "row_count_preview": 3, "rows": []},
+        action="query",
+    )
+
+    assert len(session.knowledge_graph.nodes) == 2
+    assert len(session.knowledge_graph.edges) == 1
+    edge = session.knowledge_graph.edges[0]
+    assert edge.from_id == "events:1"
+    assert edge.relation == "aprofunda"
+
+
+def test_render_knowledge_map_lists_findings_and_unexplored_units() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [
+        type("Unit", (), {"unit_name": "events"})(),
+        type("Unit", (), {"unit_name": "users"})(),
+    ]
+    session.analysis_by_unit = {"events": {"cached": True}}
+    session.knowledge_graph = orchestrator.KnowledgeGraph(
+        nodes=[
+            orchestrator.KnowledgeNode(
+                id="events:1",
+                label="Tabela events com 10 linhas.",
+                unit="events",
+                data={"unit_name": "events"},
+                timestamp="2026-05-26T00:00:00+00:00",
+            ),
+            orchestrator.KnowledgeNode(
+                id="events:2",
+                label="events_by_type: 3 linhas na prévia",
+                unit="events",
+                data={"query_id": "events_by_type"},
+                timestamp="2026-05-26T00:01:00+00:00",
+            ),
+        ],
+        edges=[
+            orchestrator.KnowledgeEdge(
+                from_id="events:1",
+                to_id="events:2",
+                relation="aprofunda",
+            )
+        ],
+    )
+
+    rendered = session.render_knowledge_map()
+    assert "## Mapa do Conhecimento" in rendered
+    assert "- [events] Tabela events com 10 linhas." in rendered
+    assert "-> aprofunda -> [events] events_by_type: 3 linhas na prévia" in rendered
+    assert "- users: não analisado" in rendered
+
+
+def test_render_knowledge_map_handles_empty_graph() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [type("Unit", (), {"unit_name": "events"})()]
+    session.analysis_by_unit = {}
+    session.knowledge_graph = orchestrator.KnowledgeGraph()
+
+    rendered = session.render_knowledge_map()
+    assert "Nenhum achado registrado ainda." in rendered
+    assert "- events: não analisado" in rendered

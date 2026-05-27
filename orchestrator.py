@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import json
 import os
 import re
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
@@ -142,6 +143,28 @@ class DeepSeekAPIError(RuntimeError):
     pass
 
 
+@dataclass
+class KnowledgeNode:
+    id: str
+    label: str
+    unit: str
+    data: dict
+    timestamp: str
+
+
+@dataclass
+class KnowledgeEdge:
+    from_id: str
+    to_id: str
+    relation: str
+
+
+@dataclass
+class KnowledgeGraph:
+    nodes: list[KnowledgeNode] = field(default_factory=list)
+    edges: list[KnowledgeEdge] = field(default_factory=list)
+
+
 class DeepSeekClient:
     def __init__(
         self,
@@ -229,6 +252,7 @@ class OrchestratorSession:
             raise ValueError("Nenhuma unidade tabular foi encontrada na origem informada.")
         self.analysis_by_unit: dict[str, object] = {}
         self.explored_paths: list[str] = []
+        self.knowledge_graph = KnowledgeGraph()
         self.history: list[dict[str, str]] = []
         self._full_structural_context: str | None = None
         self._curator_cache: dict[str, dict[str, object]] = {}
@@ -434,6 +458,8 @@ class OrchestratorSession:
             "Exato significa: mesmas colunas, mesmo filtro, mesmo agrupamento.\n"
             "Semelhante não é exato. Parecido não é exato.\n"
             "Escolha action=schema APENAS quando o usuário perguntar explicitamente sobre a estrutura ou colunas de uma tabela.\n"
+            '"explorar", "ver", "analisar", "investigar" uma tabela → action=analyze_unit\n'
+            '"quais colunas tem", "estrutura de", "schema de" → action=schema\n'
             "Perguntas como 'localize', 'busque', 'encontre' e 'mostre' são sempre action=query ou action=request_new_query.\n"
             "Se houver dúvida, use request_new_query.\n\n"
             "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO:\n"
@@ -509,31 +535,32 @@ class OrchestratorSession:
         if action == "analyze_unit":
             unit_name = str(action_payload["unit_name"])
             analysis = self.analyze_unit_on_demand(unit_name)
-            return json.dumps(
-                {
-                    "unit_name": unit_name,
-                    "summary": summarize_tabular_analysis(analysis),
-                    "metrics_summary": summarize_unit_metrics(analysis),
-                    "cached": True,
-                    "explored_paths": list(self.explored_paths),
-                },
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
+            payload = {
+                "unit_name": unit_name,
+                "summary": summarize_tabular_analysis(analysis),
+                "metrics_summary": summarize_unit_metrics(analysis),
+                "cached": True,
+                "explored_paths": list(self.explored_paths),
+            }
+            self.update_knowledge_graph(payload, action="analyze_unit")
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "schema":
             table = str(action_payload["table"])
             return json.dumps(self._schema_for_table(table), ensure_ascii=False, indent=2)
         if action == "query":
             query_id = str(action_payload["query_id"])
-            return json.dumps(self._run_catalog_query(query_id), ensure_ascii=False, indent=2, default=str)
+            payload = self._run_catalog_query(query_id)
+            self.update_knowledge_graph(payload, action="query")
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "template":
             template_id = str(action_payload["template_id"])
             params = dict(action_payload["params"])
             sql = build_sql_from_template(template_id, params)
             validate_select_sql_text(sql)
             validate_sql_by_execution(self.source_path, sql)
-            return json.dumps(self._validate_and_preview_sql(sql) | {"template_id": template_id, "sql": sql}, ensure_ascii=False, indent=2, default=str)
+            payload = self._validate_and_preview_sql(sql) | {"template_id": template_id, "sql": sql}
+            self.update_knowledge_graph(payload, action="template")
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "request_new_query":
             description = str(action_payload["description"])
             suggested_sql = str(action_payload["suggested_sql"])
@@ -546,6 +573,187 @@ class OrchestratorSession:
         if action == "done":
             return str(action_payload["conclusion"])
         raise ValueError(f"Ação não suportada: {action}")
+
+    def update_knowledge_graph(self, result: dict[str, object], *, action: str) -> None:
+        graph = getattr(self, "knowledge_graph", None)
+        if graph is None:
+            self.knowledge_graph = KnowledgeGraph()
+            graph = self.knowledge_graph
+
+        node = self._knowledge_node_from_result(result, action=action)
+        graph.nodes.append(node)
+        edge = self._curate_knowledge_edge(node)
+        if edge is not None:
+            graph.edges.append(edge)
+
+    def render_knowledge_map(self) -> str:
+        graph = getattr(self, "knowledge_graph", KnowledgeGraph())
+        lines = ["## Mapa do Conhecimento", "", "### Achados"]
+        if not graph.nodes:
+            lines.append("- Nenhum achado registrado ainda.")
+        else:
+            children_by_parent: dict[str, list[KnowledgeEdge]] = {}
+            child_ids = set()
+            for edge in graph.edges:
+                children_by_parent.setdefault(edge.from_id, []).append(edge)
+                child_ids.add(edge.to_id)
+            node_by_id = {node.id: node for node in graph.nodes}
+            root_nodes = [node for node in graph.nodes if node.id not in child_ids]
+            visited: set[str] = set()
+            for node in root_nodes:
+                self._append_knowledge_lines(
+                    lines,
+                    node=node,
+                    node_by_id=node_by_id,
+                    children_by_parent=children_by_parent,
+                    indent="",
+                    visited=visited,
+                )
+            for node in graph.nodes:
+                if node.id not in visited:
+                    self._append_knowledge_lines(
+                        lines,
+                        node=node,
+                        node_by_id=node_by_id,
+                        children_by_parent=children_by_parent,
+                        indent="",
+                        visited=visited,
+                    )
+
+        lines.extend(["", "### Caminhos não explorados"])
+        unexplored_units = [
+            unit.unit_name
+            for unit in getattr(self, "units", [])
+            if unit.unit_name not in getattr(self, "analysis_by_unit", {})
+        ]
+        if not unexplored_units:
+            lines.append("- Nenhum caminho pendente nas unidades já descobertas.")
+        else:
+            for unit_name in unexplored_units:
+                lines.append(f"- {unit_name}: não analisado")
+        return "\n".join(lines)
+
+    def _append_knowledge_lines(
+        self,
+        lines: list[str],
+        *,
+        node: KnowledgeNode,
+        node_by_id: dict[str, KnowledgeNode],
+        children_by_parent: dict[str, list[KnowledgeEdge]],
+        indent: str,
+        visited: set[str],
+    ) -> None:
+        if node.id in visited:
+            return
+        visited.add(node.id)
+        lines.append(f"{indent}- [{node.unit}] {node.label}")
+        for edge in children_by_parent.get(node.id, []):
+            child = node_by_id.get(edge.to_id)
+            if child is None:
+                continue
+            lines.append(f"{indent}  -> {edge.relation} -> [{child.unit}] {child.label}")
+            self._append_knowledge_lines(
+                lines,
+                node=child,
+                node_by_id=node_by_id,
+                children_by_parent=children_by_parent,
+                indent=f"{indent}    ",
+                visited=visited,
+            )
+
+    def _knowledge_node_from_result(self, result: dict[str, object], *, action: str) -> KnowledgeNode:
+        node_index = len(getattr(self.knowledge_graph, "nodes", [])) + 1
+        timestamp = datetime.now(timezone.utc).isoformat()
+        unit = self._infer_unit_for_knowledge(result, action=action)
+        label = self._build_knowledge_label(result, action=action)
+        node_id = f"{unit}:{node_index}"
+        return KnowledgeNode(
+            id=node_id,
+            label=label,
+            unit=unit,
+            data=result,
+            timestamp=timestamp,
+        )
+
+    def _infer_unit_for_knowledge(self, result: dict[str, object], *, action: str) -> str:
+        if action == "analyze_unit":
+            unit_name = result.get("unit_name")
+            if isinstance(unit_name, str) and unit_name.strip():
+                return unit_name.strip()
+        sql_fields = [
+            result.get("sql"),
+            result.get("from_clause"),
+        ]
+        for field_value in sql_fields:
+            if isinstance(field_value, str):
+                match = re.search(r"\bFROM\s+([A-Za-z0-9_\".]+)", field_value, flags=re.IGNORECASE)
+                if match:
+                    return match.group(1).strip('"')
+        query_id = result.get("query_id") or result.get("template_id")
+        if isinstance(query_id, str) and query_id.strip():
+            return query_id.strip()
+        return "resultado"
+
+    def _build_knowledge_label(self, result: dict[str, object], *, action: str) -> str:
+        if action == "analyze_unit":
+            summary = str(result.get("summary", "")).strip()
+            if summary:
+                return summary.splitlines()[0][:120]
+            return f"Resumo estrutural de {result.get('unit_name', 'unidade')}"
+        if action == "query":
+            query_id = str(result.get("query_id", "query")).strip()
+            row_count = result.get("row_count_preview")
+            return f"{query_id}: {row_count} linhas na prévia"
+        if action == "template":
+            template_id = str(result.get("template_id", "template")).strip()
+            row_count = result.get("row_count_preview")
+            return f"{template_id}: {row_count} linhas na prévia"
+        return str(result)[:120]
+
+    def _curate_knowledge_edge(self, new_node: KnowledgeNode) -> KnowledgeEdge | None:
+        existing_nodes = getattr(self.knowledge_graph, "nodes", [])[:-1]
+        if not existing_nodes:
+            return None
+
+        system_prompt = (
+            "Você é a IA Curadora do Cartographer.\n"
+            "Você nunca conversa e nunca cria dados novos.\n"
+            "Sua única função aqui é decidir se um novo achado se conecta a um nó já existente do grafo.\n"
+            "Responda SOMENTE com JSON válido neste formato:\n"
+            '{"from_id":"id_existente_ou_vazio","relation":"aprofunda|confirma|contradiz|"}\n'
+            "Se não houver conexão clara, use strings vazias.\n"
+        )
+        prompt = json.dumps(
+            {
+                "knowledge_graph": {
+                    "nodes": [asdict(node) for node in existing_nodes],
+                    "edges": [asdict(edge) for edge in getattr(self.knowledge_graph, "edges", [])],
+                },
+                "new_finding": asdict(new_node),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        try:
+            response = self.curator_ai.send(prompt, system_prompt=system_prompt)
+            payload = json.loads(response.content)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        from_id = payload.get("from_id")
+        relation = payload.get("relation")
+        valid_relations = {"aprofunda", "confirma", "contradiz"}
+        if (
+            not isinstance(from_id, str)
+            or not from_id.strip()
+            or from_id.strip() == new_node.id
+            or from_id.strip() not in {node.id for node in existing_nodes}
+        ):
+            return None
+        if not isinstance(relation, str) or relation.strip() not in valid_relations:
+            return None
+        return KnowledgeEdge(from_id=from_id.strip(), to_id=new_node.id, relation=relation.strip())
 
     def _schema_for_table(self, table_name: str) -> dict[str, object]:
         unit = next((item for item in self.units if item.unit_name == table_name), None)
@@ -892,6 +1100,7 @@ def print_help() -> None:
         "\nComandos especiais:\n"
         "  sair   encerra a conversa\n"
         "  ajuda  mostra esta ajuda\n"
+        "  mapa   mostra o grafo de conhecimento da sessão\n"
         "\nFora isso, escreva perguntas livres sobre a exploração do dataset.\n"
     )
 
@@ -964,6 +1173,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if user_text.lower() == "ajuda":
             print_help()
+            continue
+        if user_text.lower() == "mapa":
+            print(f"\ncartographer> {session.render_knowledge_map()}")
             continue
 
         session.history.append({"role": "user", "content": user_text})

@@ -127,6 +127,8 @@ def _run_turn(state: SessionState, user_text: str) -> str:
     session = state.orchestrator
     if user_text.lower() == "ajuda":
         return "Envie uma pergunta sobre o arquivo carregado. Se quiser encerrar, feche a página."
+    if user_text.lower() == "mapa":
+        return session.render_knowledge_map()
     if user_text.lower() == "sair":
         print_session_query_candidates(session)
         return "Sessão encerrada no chat web. Faça novo upload para recomeçar."
