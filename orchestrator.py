@@ -30,63 +30,7 @@ SUPPORTED_SUFFIXES = {
     ".sqlite": "sqlite",
     ".sqlite3": "sqlite",
 }
-QUERY_CATALOG = {
-    "knot_type_distribution": """
-        SELECT TYPE_CODE, COUNT(*) as total,
-               ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
-        FROM knot GROUP BY TYPE_CODE ORDER BY total DESC
-    """,
-    "avg_cords_per_khipu": """
-        SELECT ROUND(AVG(cord_count), 2) as avg_cords
-        FROM (SELECT KHIPU_ID, COUNT(*) as cord_count FROM cord GROUP BY KHIPU_ID)
-    """,
-    "knot_direction_by_type": """
-        SELECT k.TYPE_CODE, k.DIRECTION, COUNT(*) as total
-        FROM knot k GROUP BY k.TYPE_CODE, k.DIRECTION ORDER BY total DESC
-    """,
-    "khipu_by_region": """
-        SELECT km.REGION, COUNT(*) as total
-        FROM khipu_main km GROUP BY km.REGION ORDER BY total DESC
-    """,
-    "top_complex_khipus": """
-        SELECT km.KHIPU_ID, km.PROVENANCE, km.REGION, COUNT(c.CORD_ID) as total_cords
-        FROM khipu_main km JOIN cord c ON km.KHIPU_ID = c.KHIPU_ID
-        GROUP BY km.KHIPU_ID ORDER BY total_cords DESC LIMIT 10
-    """,
-    "knot_position_vs_direction": """
-        SELECT KNOT_POS, DIRECTION, COUNT(*) as total
-        FROM knot GROUP BY KNOT_POS, DIRECTION ORDER BY KNOT_POS, total DESC
-    """,
-    "cord_colors_distribution": """
-        SELECT AS_COLOR_CD, COUNT(*) as total
-        FROM ascher_cord_color GROUP BY AS_COLOR_CD ORDER BY total DESC LIMIT 20
-    """,
-    "datacao_valida": """
-        SELECT KHIPU_ID, EARLIEST_AGE, LATEST_AGE, REGION, PROVENANCE
-        FROM khipu_main
-        WHERE EARLIEST_AGE != '0000-00-00' AND EARLIEST_AGE IS NOT NULL
-        ORDER BY EARLIEST_AGE
-    """,
-    "globalid_by_country": """
-        SELECT "Country", COUNT(*) as total
-        FROM globalid GROUP BY "Country" ORDER BY total DESC LIMIT 20
-    """,
-    "globalid_by_region": """
-        SELECT "Political province/region", COUNT(*) as total
-        FROM globalid GROUP BY "Political province/region" ORDER BY total DESC LIMIT 20
-    """,
-    "globalid_age_distribution": """
-        SELECT
-            MIN(CAST("Model_Age_SK75" AS REAL)) as min_age,
-            MAX(CAST("Model_Age_SK75" AS REAL)) as max_age,
-            AVG(CAST("Model_Age_SK75" AS REAL)) as avg_age
-        FROM globalid WHERE "Model_Age_SK75" != ''
-    """,
-    "globalid_sample_types": """
-        SELECT "Type", COUNT(*) as total
-        FROM globalid GROUP BY "Type" ORDER BY total DESC
-    """,
-}
+QUERY_CATALOG = {}
 ANALYTIC_TEMPLATES = {
     "group_feature_signature": """
         SELECT
@@ -973,7 +917,7 @@ def build_orchestrator_prompt(
         "analytic_templates": sorted(ANALYTIC_TEMPLATES.keys()),
         "allowed_actions": [
             {"action": "analyze_unit", "unit_name": "nome_da_tabela"},
-            {"action": "query", "query_id": "knot_type_distribution"},
+            {"action": "query", "query_id": "generic_query_id"},
             {
                 "action": "template",
                 "template_id": "group_feature_signature",

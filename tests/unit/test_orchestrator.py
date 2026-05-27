@@ -32,8 +32,8 @@ def test_parse_orchestrator_json_accepts_schema_action() -> None:
 
 
 def test_parse_orchestrator_json_accepts_catalog_query_action() -> None:
-    payload = orchestrator.parse_orchestrator_json('{"action":"query","query_id":"knot_type_distribution"}')
-    assert payload == {"action": "query", "query_id": "knot_type_distribution"}
+    payload = orchestrator.parse_orchestrator_json('{"action":"query","query_id":"generic_query_id"}')
+    assert payload == {"action": "query", "query_id": "generic_query_id"}
 
 
 def test_parse_orchestrator_json_accepts_template_action() -> None:
@@ -74,8 +74,8 @@ def test_parse_orchestrator_json_rejects_non_json() -> None:
         raise AssertionError("Era esperado erro para conteúdo inválido.")
 
 
-def test_query_catalog_contains_known_query() -> None:
-    assert "knot_type_distribution" in orchestrator.QUERY_CATALOG
+def test_query_catalog_is_empty() -> None:
+    assert orchestrator.QUERY_CATALOG == {}
 
 
 def test_analytic_templates_contains_expected_templates() -> None:
@@ -145,7 +145,7 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
         last_error="",
         last_result="",
         executed_queries=[],
-        query_catalog=["knot_type_distribution"],
+        query_catalog=["generic_query_id"],
         attempt_number=1,
     )
     assert '"is_first_call": false' in prompt
@@ -174,7 +174,7 @@ def test_build_orchestrator_prompt_limits_history_to_last_three_items() -> None:
         last_error="",
         last_result="",
         executed_queries=[],
-        query_catalog=["knot_type_distribution"],
+        query_catalog=["generic_query_id"],
         attempt_number=1,
     )
     payload = orchestrator.json.loads(prompt)
@@ -468,8 +468,8 @@ def test_build_orchestrator_prompt_includes_attempt_and_error_context() -> None:
         is_first_call=False,
         last_error="Erro operacional: no such table",
         last_result='{"rows":[[1]]}',
-        executed_queries=["knot_type_distribution"],
-        query_catalog=["knot_type_distribution"],
+        executed_queries=["generic_query_id"],
+        query_catalog=["generic_query_id"],
         attempt_number=2,
     )
     assert '"attempt_number": 2' in prompt
@@ -501,7 +501,7 @@ def test_orchestrate_system_prompt_forbids_done_on_error() -> None:
         last_error="Erro operacional: x",
         last_result="",
         executed_queries=[],
-        query_catalog=["knot_type_distribution"],
+        query_catalog=["generic_query_id"],
         attempt_number=2,
     )
     assert payload == {"action": "tables"}
@@ -554,14 +554,14 @@ def test_build_orchestrator_prompt_includes_last_result_and_queries() -> None:
         compact_structural_context="events: 10 linhas",
         is_first_call=False,
         last_error="",
-        last_result='{"query_id":"knot_type_distribution","row_count_preview":1}',
-        executed_queries=["knot_type_distribution"],
-        query_catalog=["knot_type_distribution"],
+        last_result='{"query_id":"generic_query_id","row_count_preview":1}',
+        executed_queries=["generic_query_id"],
+        query_catalog=["generic_query_id"],
         attempt_number=3,
     )
     assert '"user_message": "sim"' in prompt
-    assert 'knot_type_distribution' in prompt
-    assert '"last_result": "{\\"query_id\\":\\"knot_type_distribution\\",\\"row_count_preview\\":1}"' in prompt
+    assert 'generic_query_id' in prompt
+    assert '"last_result": "{\\"query_id\\":\\"generic_query_id\\",\\"row_count_preview\\":1}"' in prompt
 
 
 def test_build_sql_from_template_group_feature_signature() -> None:
