@@ -213,6 +213,7 @@ class OrchestratorSession:
         self.explored_paths: list[str] = []
         self.knowledge_graph = KnowledgeGraph()
         self.history: list[dict[str, str]] = []
+        self._core_cache: dict[str, object] = {}
         self._full_structural_context: str | None = None
         self._curator_cache: dict[str, dict[str, object]] = {}
         self._session_query_catalog: dict[str, str] = {}
@@ -265,6 +266,7 @@ class OrchestratorSession:
         if cached is not None:
             if unit_name not in self.explored_paths:
                 self.explored_paths.append(unit_name)
+            self._set_core_cache(f"unit:{unit_name}", cached)
             return cached
 
         unit = next((item for item in self.units if item.unit_name == unit_name), None)
@@ -274,9 +276,105 @@ class OrchestratorSession:
         max_rows = load_app_config().analysis.max_rows_per_unit
         analysis = analyze_tabular_unit(unit, max_rows=max_rows)
         self.analysis_by_unit[unit_name] = analysis
+        self._set_core_cache(f"unit:{unit_name}", analysis)
         if unit_name not in self.explored_paths:
             self.explored_paths.append(unit_name)
         return analysis
+
+    def analyze_vertical(self, unit_name: str, depth: str) -> str:
+        normalized_depth = depth.strip().lower()
+        valid_depths = {"layer1", "layer2", "heuristics", "full"}
+        if normalized_depth not in valid_depths:
+            raise ValueError(f"Profundidade vertical inválida: {depth}")
+
+        analysis = self.analyze_unit_on_demand(unit_name)
+        if normalized_depth == "full":
+            cache_key = f"unit:{unit_name}"
+            payload = self._serialize_for_cache(analysis)
+        elif normalized_depth == "layer1":
+            cache_key = f"layer1:{unit_name}"
+            payload = self._extract_layer_metrics(analysis, depth="layer1")
+        elif normalized_depth == "layer2":
+            cache_key = f"layer2:{unit_name}"
+            payload = self._extract_layer_metrics(analysis, depth="layer2")
+        else:
+            cache_key = f"heuristics:{unit_name}"
+            payload = self._extract_heuristics(analysis)
+
+        self._set_core_cache(cache_key, payload)
+        return cache_key
+
+    def analyze_horizontal(self, unit_a: str, unit_b: str) -> str:
+        first = self._find_unit(unit_a)
+        second = self._find_unit(unit_b)
+        structure_a = first.get_structure()
+        structure_b = second.get_structure()
+        columns_a = {column.name: column for column in structure_a.columns}
+        columns_b = {column.name: column for column in structure_b.columns}
+        same_name_columns = sorted(set(columns_a) & set(columns_b))
+
+        rows_a = list(first.get_rows())[:50]
+        rows_b = list(second.get_rows())[:50]
+        value_sets_a = self._column_value_sets(structure_a, rows_a)
+        value_sets_b = self._column_value_sets(structure_b, rows_b)
+
+        compatible_cardinality: list[dict[str, object]] = []
+        matching_value_patterns: list[dict[str, object]] = []
+        for column_a in structure_a.columns:
+            for column_b in structure_b.columns:
+                values_a = value_sets_a.get(column_a.name, set())
+                values_b = value_sets_b.get(column_b.name, set())
+                if not values_a or not values_b:
+                    continue
+                len_a = len(values_a)
+                len_b = len(values_b)
+                ratio = min(len_a, len_b) / max(len_a, len_b)
+                if ratio >= 0.8:
+                    compatible_cardinality.append(
+                        {
+                            "column_a": column_a.name,
+                            "column_b": column_b.name,
+                            "distinct_values_a": len_a,
+                            "distinct_values_b": len_b,
+                        }
+                    )
+                overlap = values_a & values_b
+                overlap_ratio = len(overlap) / min(len_a, len_b)
+                if overlap_ratio >= 0.5:
+                    matching_value_patterns.append(
+                        {
+                            "column_a": column_a.name,
+                            "column_b": column_b.name,
+                            "overlap_count": len(overlap),
+                            "overlap_ratio": round(overlap_ratio, 3),
+                            "sample_overlap": sorted(str(item) for item in list(overlap)[:5]),
+                        }
+                    )
+
+        payload = {
+            "unit_a": unit_a,
+            "unit_b": unit_b,
+            "same_name_columns": same_name_columns,
+            "compatible_cardinality": compatible_cardinality,
+            "matching_value_patterns": matching_value_patterns,
+        }
+        cache_key = f"cross:{unit_a}:{unit_b}"
+        self._set_core_cache(cache_key, payload)
+        return cache_key
+
+    def recall_core_cache(self, key: str) -> dict[str, object]:
+        payload = getattr(self, "_core_cache", {}).get(key)
+        if payload is None:
+            return {
+                "key": key,
+                "found": False,
+                "message": "Cálculo ainda não foi feito para esta chave.",
+            }
+        return {
+            "key": key,
+            "found": True,
+            "cached_result": payload,
+        }
 
     def build_structural_context(self, analyses: list[object]) -> str:
         sections = [
@@ -375,6 +473,12 @@ class OrchestratorSession:
             "- amostra pequena (menos de 3 entidades)\n"
             "- resultado parcial\n"
             'Nunca use "descoberta", "exclusivo" ou "predominante" sem validação completa.\n'
+            "Quando o usuário expressar um objetivo aberto (ex: 'encontrar o criminoso', 'descobrir padrões', 'entender essa tabela'):\n"
+            "- Identifique se o objetivo requer aprofundar uma tabela (vertical) ou cruzar tabelas (horizontal)\n"
+            "- Informe ao usuário qual análise você sugere e por quê\n"
+            "- Nunca execute diretamente — informe a intenção para a Orquestradora decidir\n"
+            "Análise vertical: quando o usuário quer entender uma tabela em profundidade\n"
+            "Análise horizontal: quando o usuário menciona relações entre tabelas ou objetivos que requerem cruzamento\n"
         )
         prompt = build_interface_prompt(
             source_path=self.source_path,
@@ -407,6 +511,9 @@ class OrchestratorSession:
             "LEI 1 — FORMATO ABSOLUTO:\n"
             "Toda resposta deve ser exatamente um destes JSONs:\n"
             '  {"action":"analyze_unit","unit_name":"nome_da_tabela"}\n'
+            '  {"action":"analyze_vertical","unit_name":"nome_da_tabela","depth":"layer1|layer2|heuristics|full"}\n'
+            '  {"action":"analyze_horizontal","unit_a":"nome_a","unit_b":"nome_b"}\n'
+            '  {"action":"recall","key":"unit:nome_da_tabela"}\n'
             '  {"action":"query","query_id":"id_do_catalogo"}\n'
             '  {"action":"template","template_id":"group_feature_signature","params":{"group_expr":"...","feature_expr":"...","from_clause":"...","where_clause":"...","subfeature_expr":"","subfeature_group":""}}\n'
             '  {"action":"request_new_query","description":"o que precisa","suggested_sql":"SELECT ..."}\n'
@@ -424,6 +531,13 @@ class OrchestratorSession:
             '"explorar", "ver", "analisar", "investigar" uma tabela → action=analyze_unit\n'
             '"quais colunas tem", "estrutura de", "schema de" → action=schema\n'
             "Perguntas como 'localize', 'busque', 'encontre' e 'mostre' são sempre action=query ou action=request_new_query.\n"
+            "Quando o contexto contiver analysis_intent=vertical:\n"
+            "- Use action=analyze_vertical com a tabela mais relevante\n"
+            "Quando o contexto contiver analysis_intent=horizontal:\n"
+            "- Use action=analyze_horizontal com as duas tabelas mais relevantes\n"
+            "Quando o objetivo for aberto e desconhecido:\n"
+            "- Use action=analyze_vertical na tabela central primeiro\n"
+            "- Depois use action=analyze_horizontal para detectar relações\n"
             "Se houver dúvida, use request_new_query.\n\n"
             "LEI 3 — SEM COBERTURA = request_new_query OBRIGATÓRIO:\n"
             "Se nenhum query_id do catálogo atender exatamente, SEMPRE emita request_new_query.\n"
@@ -519,6 +633,35 @@ class OrchestratorSession:
             }
             self.update_knowledge_graph(payload, action="analyze_unit")
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        if action == "analyze_vertical":
+            unit_name = str(action_payload["unit_name"])
+            depth = str(action_payload["depth"])
+            cache_key = self.analyze_vertical(unit_name, depth)
+            return json.dumps(
+                {
+                    "status": "cached",
+                    "cache_key": cache_key,
+                    "message": "Cálculo vertical salvo no cache interno.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        if action == "analyze_horizontal":
+            unit_a = str(action_payload["unit_a"])
+            unit_b = str(action_payload["unit_b"])
+            cache_key = self.analyze_horizontal(unit_a, unit_b)
+            return json.dumps(
+                {
+                    "status": "cached",
+                    "cache_key": cache_key,
+                    "message": "Cálculo horizontal salvo no cache interno.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        if action == "recall":
+            key = str(action_payload["key"])
+            return json.dumps(self.recall_core_cache(key), ensure_ascii=False, indent=2, default=str)
         if action == "schema":
             table = str(action_payload["table"])
             return json.dumps(self._schema_for_table(table), ensure_ascii=False, indent=2)
@@ -759,6 +902,66 @@ class OrchestratorSession:
             return "query"
         return "unknown"
 
+    def _find_unit(self, unit_name: str):
+        unit = next((item for item in getattr(self, "units", []) if item.unit_name == unit_name), None)
+        if unit is None:
+            raise ValueError(f"Unidade não encontrada: {unit_name}")
+        return unit
+
+    def _set_core_cache(self, key: str, payload: object) -> None:
+        cache = getattr(self, "_core_cache", None)
+        if cache is None:
+            self._core_cache = {}
+            cache = self._core_cache
+        cache[key] = payload
+
+    def _extract_layer_metrics(self, analysis: object, *, depth: str) -> dict[str, object]:
+        columns = getattr(analysis, "columns", {}) or {}
+        payload_columns: dict[str, object] = {}
+        for column_name, column in columns.items():
+            payload_columns[column_name] = self._serialize_for_cache(getattr(column, f"{depth}_metrics"))
+        standardized = getattr(analysis, "standardized", None)
+        return {
+            "unit_name": getattr(analysis, "unit_name", ""),
+            "depth": depth,
+            "row_count": getattr(standardized, "row_count", None),
+            "column_order": list(getattr(standardized, "column_order", ()) or ()),
+            "columns": payload_columns,
+        }
+
+    def _extract_heuristics(self, analysis: object) -> dict[str, object]:
+        columns = getattr(analysis, "columns", {}) or {}
+        payload_columns: dict[str, object] = {}
+        for column_name, column in columns.items():
+            payload_columns[column_name] = self._serialize_for_cache(getattr(column, "heuristics", ()))
+        return {
+            "unit_name": getattr(analysis, "unit_name", ""),
+            "depth": "heuristics",
+            "columns": payload_columns,
+        }
+
+    def _serialize_for_cache(self, payload: object) -> object:
+        if hasattr(payload, "__dataclass_fields__"):
+            return {key: self._serialize_for_cache(value) for key, value in asdict(payload).items()}
+        if isinstance(payload, dict):
+            return {str(key): self._serialize_for_cache(value) for key, value in payload.items()}
+        if isinstance(payload, (list, tuple)):
+            return [self._serialize_for_cache(item) for item in payload]
+        return payload
+
+    def _column_value_sets(self, structure: object, rows: list[tuple[object, ...]]) -> dict[str, set[str]]:
+        columns = list(getattr(structure, "columns", ()) or ())
+        result = {column.name: set() for column in columns}
+        for row in rows:
+            for index, column in enumerate(columns):
+                if index >= len(row):
+                    continue
+                value = row[index]
+                if value is None or value == "":
+                    continue
+                result[column.name].add(str(value))
+        return result
+
     def _schema_for_table(self, table_name: str) -> dict[str, object]:
         unit = next((item for item in self.units if item.unit_name == table_name), None)
         if unit is None:
@@ -878,6 +1081,7 @@ def build_interface_prompt(
         "source_type": source_type,
         "history": history[-3:],
         "is_first_call": is_first_call,
+        "analysis_intent": detect_analysis_intent(user_text),
         "structural_context": structural_context,
         "user_message": user_text,
         "available_result": result_context,
@@ -908,6 +1112,7 @@ def build_orchestrator_prompt(
         "history": history[-3:],
         "is_first_call": is_first_call,
         "attempt_number": attempt_number,
+        "analysis_intent": detect_analysis_intent(user_text),
         "user_message": user_text,
         "structural_context": structural_context if is_first_call else compact_structural_context,
         "last_error": last_error or "",
@@ -917,6 +1122,9 @@ def build_orchestrator_prompt(
         "analytic_templates": sorted(ANALYTIC_TEMPLATES.keys()),
         "allowed_actions": [
             {"action": "analyze_unit", "unit_name": "nome_da_tabela"},
+            {"action": "analyze_vertical", "unit_name": "nome_da_tabela", "depth": "layer1"},
+            {"action": "analyze_horizontal", "unit_a": "nome_a", "unit_b": "nome_b"},
+            {"action": "recall", "key": "unit:nome_da_tabela"},
             {"action": "query", "query_id": "generic_query_id"},
             {
                 "action": "template",
@@ -968,6 +1176,28 @@ def parse_orchestrator_json(raw_content: str) -> dict[str, object]:
         if not isinstance(unit_name, str) or not unit_name.strip():
             raise ValueError("Ação analyze_unit exige o campo 'unit_name'.")
         return {"action": "analyze_unit", "unit_name": unit_name.strip()}
+    if action == "analyze_vertical":
+        unit_name = payload.get("unit_name")
+        depth = payload.get("depth")
+        valid_depths = {"layer1", "layer2", "heuristics", "full"}
+        if not isinstance(unit_name, str) or not unit_name.strip():
+            raise ValueError("Ação analyze_vertical exige o campo 'unit_name'.")
+        if not isinstance(depth, str) or depth.strip() not in valid_depths:
+            raise ValueError("Ação analyze_vertical exige o campo 'depth' válido.")
+        return {"action": "analyze_vertical", "unit_name": unit_name.strip(), "depth": depth.strip()}
+    if action == "analyze_horizontal":
+        unit_a = payload.get("unit_a")
+        unit_b = payload.get("unit_b")
+        if not isinstance(unit_a, str) or not unit_a.strip():
+            raise ValueError("Ação analyze_horizontal exige o campo 'unit_a'.")
+        if not isinstance(unit_b, str) or not unit_b.strip():
+            raise ValueError("Ação analyze_horizontal exige o campo 'unit_b'.")
+        return {"action": "analyze_horizontal", "unit_a": unit_a.strip(), "unit_b": unit_b.strip()}
+    if action == "recall":
+        key = payload.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Ação recall exige o campo 'key'.")
+        return {"action": "recall", "key": key.strip()}
     if action == "schema":
         table = payload.get("table")
         if not isinstance(table, str) or not table.strip():
@@ -1027,6 +1257,37 @@ def parse_curator_json(raw_content: str) -> dict[str, object]:
         "relevant_units": [item.strip() for item in relevant_units if item.strip()],
         "curated_context": curated_context.strip(),
     }
+
+
+def detect_analysis_intent(user_text: str) -> str:
+    normalized = user_text.strip().lower()
+    horizontal_keywords = (
+        "entre ",
+        "relação",
+        "relacao",
+        "cruz",
+        "juntar",
+        "ligação",
+        "ligacao",
+        "comparar",
+        "conectar",
+    )
+    vertical_keywords = (
+        "entender",
+        "explorar",
+        "analisar",
+        "investigar",
+        "aprofundar",
+        "essa tabela",
+        "esta tabela",
+        "descobrir padrões",
+        "descobrir padroes",
+    )
+    if any(keyword in normalized for keyword in horizontal_keywords):
+        return "horizontal"
+    if any(keyword in normalized for keyword in vertical_keywords):
+        return "vertical"
+    return "unknown"
 
 
 def validate_select_sql_text(sql: str) -> str:

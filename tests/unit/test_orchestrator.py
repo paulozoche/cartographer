@@ -26,6 +26,33 @@ def test_parse_orchestrator_json_accepts_analyze_unit_action() -> None:
     }
 
 
+def test_parse_orchestrator_json_accepts_analyze_vertical_action() -> None:
+    assert orchestrator.parse_orchestrator_json(
+        '{"action":"analyze_vertical","unit_name":"events","depth":"layer1"}'
+    ) == {
+        "action": "analyze_vertical",
+        "unit_name": "events",
+        "depth": "layer1",
+    }
+
+
+def test_parse_orchestrator_json_accepts_analyze_horizontal_action() -> None:
+    assert orchestrator.parse_orchestrator_json(
+        '{"action":"analyze_horizontal","unit_a":"events","unit_b":"users"}'
+    ) == {
+        "action": "analyze_horizontal",
+        "unit_a": "events",
+        "unit_b": "users",
+    }
+
+
+def test_parse_orchestrator_json_accepts_recall_action() -> None:
+    assert orchestrator.parse_orchestrator_json('{"action":"recall","key":"unit:events"}') == {
+        "action": "recall",
+        "key": "unit:events",
+    }
+
+
 def test_parse_orchestrator_json_accepts_schema_action() -> None:
     payload = orchestrator.parse_orchestrator_json('{"action":"schema","table":"events"}')
     assert payload == {"action": "schema", "table": "events"}
@@ -107,6 +134,20 @@ def test_build_interface_prompt_includes_first_call_flag() -> None:
     )
     assert '"is_first_call": true' in prompt
     assert '"structural_context": "contexto completo"' in prompt
+    assert '"analysis_intent": "unknown"' in prompt
+
+
+def test_build_interface_prompt_includes_detected_analysis_intent() -> None:
+    prompt = orchestrator.build_interface_prompt(
+        source_path="/tmp/sample.db",
+        source_type="sqlite",
+        history=[],
+        user_text="quero entender essa tabela",
+        result_context="resultado",
+        structural_context="contexto completo",
+        is_first_call=False,
+    )
+    assert '"analysis_intent": "vertical"' in prompt
 
 
 def test_build_interface_prompt_limits_history_to_last_three_items() -> None:
@@ -153,6 +194,7 @@ def test_build_orchestrator_prompt_uses_compact_context_after_first_call() -> No
     assert "contexto completo" not in prompt
     assert '"query_catalog": [' in prompt
     assert '"analytic_templates": [' in prompt
+    assert '"analysis_intent": "unknown"' in prompt
     assert '"action": "analyze_unit"' in prompt
 
 
@@ -309,6 +351,7 @@ def test_analyze_unit_on_demand_uses_cache(monkeypatch) -> None:
     session.units = [type("Unit", (), {"unit_name": "events"})()]
     session.analysis_by_unit = {}
     session.explored_paths = []
+    session._core_cache = {}
 
     calls = {"count": 0}
 
@@ -326,12 +369,14 @@ def test_analyze_unit_on_demand_uses_cache(monkeypatch) -> None:
     assert first == second
     assert calls["count"] == 1
     assert session.explored_paths == ["events"]
+    assert session._core_cache["unit:events"] == first
 
 
 def test_execute_action_analyze_unit_returns_summary(monkeypatch) -> None:
     session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
     session.explored_paths = ["events"]
     session.knowledge_graph = orchestrator.KnowledgeGraph()
+    session._core_cache = {}
 
     class QuietCurator:
         def send(self, prompt: str, *, system_prompt: str | None = None):
@@ -348,6 +393,96 @@ def test_execute_action_analyze_unit_returns_summary(monkeypatch) -> None:
     assert payload["metrics_summary"] == ["3 linhas", "2 colunas"]
     assert len(session.knowledge_graph.nodes) == 1
     assert session.knowledge_graph.nodes[0].unit == "events"
+
+
+def test_execute_action_analyze_vertical_caches_without_exposing_result(monkeypatch) -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [type("Unit", (), {"unit_name": "events"})()]
+    session.analysis_by_unit = {}
+    session.explored_paths = []
+    session._core_cache = {}
+
+    analysis = type(
+        "Analysis",
+        (),
+        {
+            "unit_name": "events",
+            "standardized": type("Standardized", (), {"row_count": 3, "column_order": ("id",)})(),
+            "columns": {
+                "id": type(
+                    "Column",
+                    (),
+                    {
+                        "layer1_metrics": {"null_ratio": 0.0},
+                        "layer2_metrics": {"entropy": 1.0},
+                        "heuristics": ({"name": "identifier"},),
+                    },
+                )()
+            },
+        },
+    )()
+
+    session.analyze_unit_on_demand = lambda unit_name: analysis
+    payload = orchestrator.json.loads(
+        session.execute_action({"action": "analyze_vertical", "unit_name": "events", "depth": "layer1"})
+    )
+    assert payload["status"] == "cached"
+    assert payload["cache_key"] == "layer1:events"
+    assert session._core_cache["layer1:events"]["columns"]["id"] == {"null_ratio": 0.0}
+
+
+def test_execute_action_recall_returns_cached_result() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session._core_cache = {"unit:events": {"unit_name": "events", "signal": 0.9}}
+
+    payload = orchestrator.json.loads(session.execute_action({"action": "recall", "key": "unit:events"}))
+    assert payload["found"] is True
+    assert payload["cached_result"] == {"unit_name": "events", "signal": 0.9}
+
+
+def test_execute_action_recall_returns_missing_message() -> None:
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session._core_cache = {}
+
+    payload = orchestrator.json.loads(session.execute_action({"action": "recall", "key": "unit:events"}))
+    assert payload["found"] is False
+    assert "ainda não foi feito" in payload["message"]
+
+
+def test_execute_action_analyze_horizontal_caches_cross_result() -> None:
+    class Unit:
+        def __init__(self, unit_name, columns, rows):
+            self.unit_name = unit_name
+            self._columns = columns
+            self._rows = rows
+
+        def get_structure(self):
+            return type(
+                "Structure",
+                (),
+                {"columns": tuple(type("Column", (), {"name": name})() for name in self._columns)},
+            )()
+
+        def get_rows(self):
+            for row in self._rows:
+                yield row
+
+    session = orchestrator.OrchestratorSession.__new__(orchestrator.OrchestratorSession)
+    session.units = [
+        Unit("crime_scene_report", ["person_id", "city"], [(1, "Boston"), (2, "Salem")]),
+        Unit("person", ["person_id", "name"], [(1, "Ana"), (2, "Bob")]),
+    ]
+    session._core_cache = {}
+
+    payload = orchestrator.json.loads(
+        session.execute_action(
+            {"action": "analyze_horizontal", "unit_a": "crime_scene_report", "unit_b": "person"}
+        )
+    )
+    assert payload["status"] == "cached"
+    cache_key = "cross:crime_scene_report:person"
+    assert payload["cache_key"] == cache_key
+    assert session._core_cache[cache_key]["same_name_columns"] == ["person_id"]
 
 
 def test_curated_context_for_falls_back_to_full_context_on_failure() -> None:
