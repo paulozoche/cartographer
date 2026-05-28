@@ -13,6 +13,7 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from agnostic.ai.ports.ai_orchestrator import AIResponse
+from agnostic.application.planning.planning_context import PlanningContext
 from agnostic.application.planning.requirement_priority import sort_pending_requirements_for_investigation
 from agnostic.application.planning.rule_based_planner import (
     extract_units_from_sql,
@@ -88,6 +89,94 @@ INTERFACE_MODEL = "deepseek-chat"
 ORCHESTRATOR_MODEL = "deepseek-chat"
 CURATOR_MODEL = "deepseek-chat"
 logger = logging.getLogger(__name__)
+
+
+def build_planning_context(session) -> PlanningContext:
+    recent_nodes: list[dict[str, object]] = []
+    graph = getattr(session, "knowledge_graph", None)
+    for node in reversed(getattr(graph, "nodes", [])) if graph is not None else []:
+        recent_nodes.append(
+            {
+                "id": str(getattr(node, "id", "")).strip(),
+                "unit": str(getattr(node, "unit", "")).strip(),
+                "timestamp": str(getattr(node, "timestamp", "")).strip(),
+                "next_requirements": list(getattr(node, "next_requirements", []) or []),
+                "sample_entities": list(getattr(node, "sample_entities", []) or []),
+            }
+        )
+    known_entities: list[dict[str, str]] = []
+    for node in recent_nodes:
+        unit_name = str(node.get("unit", "")).strip()
+        for entity in node.get("sample_entities", []) or []:
+            if not isinstance(entity, str):
+                continue
+            for part in entity.split(","):
+                if "=" not in part:
+                    continue
+                column, value = part.split("=", 1)
+                column = column.strip()
+                value = value.strip()
+                if column and value:
+                    known_entities.append({"unit": unit_name, "column": column, "value": value})
+    cache = getattr(session, "_core_cache", {})
+    if isinstance(cache, dict):
+        for payload in cache.values():
+            if not isinstance(payload, dict):
+                continue
+            units = payload.get("units", [])
+            columns = payload.get("columns", [])
+            rows = payload.get("rows", [])
+            unit_name = str(units[0]).strip() if isinstance(units, list) and units else ""
+            if not unit_name or not isinstance(columns, list) or not isinstance(rows, list):
+                continue
+            for row in rows[:20]:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                for index, column in enumerate(columns):
+                    if index >= len(row):
+                        continue
+                    value = row[index]
+                    if value is None:
+                        continue
+                    text_value = str(value).strip()
+                    if text_value:
+                        known_entities.append({"unit": unit_name, "column": str(column).strip(), "value": text_value})
+    unit_columns: dict[str, list[str]] = {}
+    text_columns_by_unit: dict[str, list[str]] = {}
+    categorical_columns_by_unit: dict[str, list[str]] = {}
+    for unit in getattr(session, "units", []):
+        unit_name = str(getattr(unit, "unit_name", "")).strip()
+        if not unit_name:
+            continue
+        try:
+            structure = unit.get_structure()
+        except Exception:
+            structure = None
+        columns = [str(getattr(column, "name", "")).strip() for column in getattr(structure, "columns", ()) if str(getattr(column, "name", "")).strip()] if structure is not None else []
+        unit_columns[unit_name] = columns
+        classified = classify_columns_from_structure(structure) if structure is not None else None
+        if isinstance(classified, dict):
+            text_columns_by_unit[unit_name] = [str(item) for item in classified.get("text_columns", [])]
+            categorical_columns_by_unit[unit_name] = [str(item) for item in classified.get("categorical_columns", [])]
+        else:
+            text_columns_by_unit[unit_name] = list(columns)
+            categorical_columns_by_unit[unit_name] = list(columns)
+    select_builder = getattr(session, "_build_select_columns_for_filtered_query", None)
+    pending_requirements = graph.pending_requirements(active_focus=getattr(session, "_active_focus", None)) if graph is not None else []
+    return PlanningContext(
+        pending_requirements=list(pending_requirements),
+        active_focus=getattr(session, "_active_focus", None),
+        available_units=[str(getattr(unit, "unit_name", "")).strip() for unit in getattr(session, "units", []) if str(getattr(unit, "unit_name", "")).strip()],
+        recent_nodes=recent_nodes,
+        last_presented_options=list(getattr(session, "_last_presented_options", None) or []),
+        known_entities=known_entities,
+        execution_log=list(getattr(session, "_execution_log", []) or []),
+        unit_columns=unit_columns,
+        text_columns_by_unit=text_columns_by_unit,
+        categorical_columns_by_unit=categorical_columns_by_unit,
+        select_clause_builder=select_builder if callable(select_builder) else None,
+        raw_session=session,
+    )
 
 
 class DeepSeekAPIError(RuntimeError):
