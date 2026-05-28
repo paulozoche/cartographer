@@ -5,6 +5,13 @@ import re
 from typing import TYPE_CHECKING
 
 from agnostic.application.planning.requirement_priority import sort_pending_requirements_for_investigation
+from agnostic.application.planning.sql_generation import (
+    build_direct_search_sql,
+    build_multi_value_filter_sql,
+    build_safe_select_sql,
+    build_value_filter_sql,
+    validate_generated_select_sql,
+)
 
 if TYPE_CHECKING:
     from orchestrator import OrchestratorSession
@@ -15,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 SHORT_CONFIRMATIONS = {"sim", "si", "ok", "pode", "prossiga", "continue", "vai", "execute"}
 CONTINUATION_WORDS = SHORT_CONFIRMATIONS | {"continue", "continue daí", "continue dai", "siga", "avançe", "avance"}
+_validate_generated_select_sql = validate_generated_select_sql
 
 
 def normalize_text(text: str) -> str:
@@ -144,57 +152,16 @@ def _build_value_filter_sql(session: "OrchestratorSession", *, unit_name: str, c
             select_clause = str(builder(unit_name, column or ""))
         except Exception:
             select_clause = "*"
-    quoted_value = _quote_sql_literal(value)
-    if column:
-        return f"SELECT {select_clause} FROM {unit_name} WHERE LOWER(CAST({column} AS TEXT)) = LOWER({quoted_value}) LIMIT 50"
     text_columns, categorical_columns = _textual_columns_for_unit(session, unit_name)
-    fallback_columns = []
-    for candidate in categorical_columns + text_columns:
-        if candidate not in fallback_columns:
-            fallback_columns.append(candidate)
-    if not fallback_columns:
-        return None
-    clauses = [f"LOWER(CAST({candidate} AS TEXT)) = LOWER({quoted_value})" for candidate in fallback_columns[:4]]
-    escaped_value = value.replace("'", "''")
-    like_clauses = [f"LOWER(CAST({candidate} AS TEXT)) LIKE LOWER('%{escaped_value}%')" for candidate in text_columns[:2]]
-    predicate = " OR ".join(clauses + like_clauses)
-    if not predicate:
-        return None
-    return f"SELECT {select_clause} FROM {unit_name} WHERE {predicate} LIMIT 50"
-
-
-def build_safe_select_sql(
-    unit: str,
-    select_columns: list[str],
-    conditions: list[str],
-    *,
-    mode: str = "AND",
-    limit: int = 50,
-) -> str | None:
-    normalized_unit = unit.strip()
-    if not normalized_unit:
-        return None
-    cleaned_columns: list[str] = []
-    for column in select_columns:
-        normalized_column = str(column).strip()
-        if normalized_column and normalized_column not in cleaned_columns:
-            cleaned_columns.append(normalized_column)
-    select_clause = ", ".join(cleaned_columns) if cleaned_columns else "*"
-    cleaned_conditions: list[str] = []
-    for condition in conditions:
-        normalized_condition = str(condition).strip()
-        if normalized_condition and normalized_condition not in cleaned_conditions:
-            cleaned_conditions.append(normalized_condition)
-    if not cleaned_conditions:
-        return None
-    joiner = " AND " if mode == "AND" else " OR "
-    where_clause = joiner.join(cleaned_conditions)
-    if not where_clause.strip():
-        return None
-    sql = f"SELECT {select_clause} FROM {normalized_unit} WHERE {where_clause} LIMIT {int(limit)}"
-    if "SELECT FROM" in sql or "SELECT ," in sql or "WHERE  LIMIT" in sql or "FROM  WHERE" in sql:
-        return None
-    return sql
+    return build_value_filter_sql(
+        unit_name=unit_name,
+        column=column,
+        value=value,
+        select_clause=select_clause,
+        text_columns=text_columns,
+        categorical_columns=categorical_columns,
+        quote_sql_literal=_quote_sql_literal,
+    )
 
 
 def plan_filter_for_observed_value(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
@@ -484,7 +451,7 @@ def plan_grouped_count_by_dimension(session: "OrchestratorSession", user_text: s
         f"ORDER BY total DESC "
         f"LIMIT 50"
     )
-    validated_sql = _validate_generated_select_sql(sql)
+    validated_sql = validate_generated_select_sql(sql)
     if validated_sql is None:
         return None
     upper = validated_sql.upper()
@@ -639,7 +606,7 @@ def plan_multi_value_filter(session: "OrchestratorSession", user_text: str) -> d
         return {
             "action": "request_new_query",
             "description": "amostrar registros filtrados por multiplos valores observados",
-            "suggested_sql": f"SELECT {select_clause} FROM {unit_name} WHERE {where_clause} LIMIT 50",
+            "suggested_sql": build_multi_value_filter_sql(unit_name=unit_name, select_clause=select_clause, where_clause=where_clause),
         }
     recent_units = _recent_or_plausible_units(session)
     if not recent_units:
@@ -670,31 +637,12 @@ def plan_multi_value_filter(session: "OrchestratorSession", user_text: str) -> d
     return {
         "action": "request_new_query",
         "description": "amostrar registros filtrados por multiplos valores",
-        "suggested_sql": f"SELECT {select_clause} FROM {unit_name} WHERE {' AND '.join(grouped_clauses)} LIMIT 50",
+        "suggested_sql": build_multi_value_filter_sql(
+            unit_name=unit_name,
+            select_clause=select_clause,
+            where_clause=" AND ".join(grouped_clauses),
+        ),
     }
-
-
-def _validate_generated_select_sql(sql: str) -> str | None:
-    try:
-        from orchestrator import validate_select_sql_text
-
-        normalized = validate_select_sql_text(sql)
-    except Exception:
-        return None
-    upper = normalized.upper()
-    if (
-        "SELECT FROM" in upper
-        or "SELECT ," in upper
-        or "WHERE LIMIT" in upper
-        or "FROM  WHERE" in upper
-        or "GROUP BY ORDER" in upper
-        or "; LIMIT" in upper
-        or "FROM  GROUP" in upper
-    ):
-        return None
-    if "FROM" not in upper:
-        return None
-    return normalized
 
 
 def focused_pending_requirements(session: "OrchestratorSession") -> list[dict[str, object]]:
@@ -828,7 +776,7 @@ def _direct_search_sql(session: "OrchestratorSession", *, unit_name: str, value:
     clauses = [f"LOWER(CAST({column} AS TEXT)) = LOWER({quoted_value})" for column in candidate_columns[:4]]
     if not clauses:
         return None
-    return f"SELECT {select_clause} FROM {unit_name} WHERE {' OR '.join(clauses)} LIMIT 50"
+    return build_direct_search_sql(unit_name=unit_name, select_clause=select_clause, clauses=clauses)
 
 
 def _numeric_option_payload(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
