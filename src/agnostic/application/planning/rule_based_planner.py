@@ -4,6 +4,8 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from agnostic.application.planning.requirement_priority import sort_pending_requirements_for_investigation
+
 if TYPE_CHECKING:
     from orchestrator import OrchestratorSession
 
@@ -13,157 +15,6 @@ logger = logging.getLogger(__name__)
 
 SHORT_CONFIRMATIONS = {"sim", "si", "ok", "pode", "prossiga", "continue", "vai", "execute"}
 CONTINUATION_WORDS = SHORT_CONFIRMATIONS | {"continue", "continue daí", "continue dai", "siga", "avançe", "avance"}
-TEXTUAL_INTENT_TERMS = {
-    "entrevista",
-    "entrevistas",
-    "depoimento",
-    "depoimentos",
-    "relato",
-    "relatos",
-    "testemunha",
-    "testemunhas",
-    "transcript",
-    "interview",
-    "statement",
-    "testimony",
-}
-TEXTUAL_COLUMN_TOKENS = {
-    "transcript",
-    "description",
-    "text",
-    "note",
-    "content",
-    "message",
-    "comment",
-    "statement",
-    "narrative",
-    "body",
-}
-LOW_SIGNAL_LOG_TOKENS = {"event", "log", "checkin", "history", "visit", "activity"}
-
-
-def sort_pending_requirements_for_investigation(
-    requirements: list[dict[str, object]],
-    *,
-    active_focus: dict[str, object] | None = None,
-    session: "OrchestratorSession" | None = None,
-    graph: object | None = None,
-    user_text: str = "",
-) -> list[dict[str, object]]:
-    clue_group_id = ""
-    if isinstance(active_focus, dict):
-        clue_group_id = str(active_focus.get("clue_group_id", "")).strip()
-
-    normalized_user_text = normalize_text(user_text)
-
-    graph_obj = graph if graph is not None else (getattr(session, "knowledge_graph", None) if session is not None else None)
-
-    def _unit_is_already_analyzed(unit_name: str) -> bool:
-        if not unit_name:
-            return False
-        if session is not None:
-            execution_log = getattr(session, "_execution_log", [])
-            analyzed = any(
-                entry.get("action") == "analyze_unit" and entry.get("unit") == unit_name
-                for entry in execution_log
-            )
-            cached = bool(getattr(session, "_core_cache", {}).get(f"unit:{unit_name}"))
-            if analyzed or cached:
-                return True
-            nodes = getattr(graph_obj, "nodes", []) if graph_obj is not None else []
-        else:
-            nodes = getattr(graph_obj, "nodes", []) if graph_obj is not None else []
-        for node in nodes:
-            node_unit = str(getattr(node, "unit", "")).strip()
-            if node_unit != unit_name:
-                continue
-            node_columns = getattr(node, "columns", []) or []
-            node_data = getattr(node, "data", {})
-            if not isinstance(node_data, dict):
-                node_data = {}
-            evidence = node_data.get("evidence", {})
-            operational_summary = node_data.get("operational_summary", {})
-            if (
-                node_columns
-                or isinstance(evidence, dict) and bool(evidence.get("columns"))
-                or isinstance(operational_summary, dict) and bool(operational_summary.get("columns"))
-                or bool(getattr(node, "next_requirements", []))
-            ):
-                return True
-        return False
-
-    def _is_useful_operational_requirement(requirement: dict[str, object]) -> bool:
-        kind = str(requirement.get("kind", "")).strip().lower()
-        role = str(requirement.get("role", "")).strip().lower()
-        if kind in {"query", "template", "analyze_horizontal", "analyze_vertical"}:
-            return True
-        if role in {"textual_clue", "related_entity"}:
-            return True
-        suggested_action = requirement.get("suggested_action")
-        if isinstance(suggested_action, dict):
-            action = str(suggested_action.get("action", "")).strip().lower()
-            if action in {"request_new_query", "analyze_vertical"}:
-                return True
-        return False
-
-    def schema_deprioritized(requirement: dict[str, object]) -> bool:
-        if str(requirement.get("kind", "")).strip().lower() != "schema":
-            return False
-        if _schema_requested_explicitly(normalized_user_text):
-            return False
-        units = requirement.get("units", [])
-        unit_name = str(units[0]).strip() if isinstance(units, list) and units else ""
-        if unit_name and not _unit_is_already_analyzed(unit_name):
-            return False
-        for candidate in requirements:
-            if candidate is requirement or str(candidate.get("status", "")).strip().lower() != "pending":
-                continue
-            if _is_useful_operational_requirement(candidate):
-                return True
-        return False
-
-    def role_priority(requirement: dict[str, object]) -> tuple[int, ...]:
-        kind = str(requirement.get("kind", "")).strip().lower()
-        role = str(requirement.get("role", "")).strip().lower()
-        source_node_id = str(requirement.get("source_node_id", "")).strip()
-        parent_requirement_id = str(requirement.get("parent_requirement_id", "")).strip()
-        active_focus_node_id = str(active_focus.get("node_id", "")).strip() if isinstance(active_focus, dict) else ""
-        active_focus_requirement_id = str(active_focus.get("source_requirement_id", "")).strip() if isinstance(active_focus, dict) else ""
-
-        if clue_group_id and role == "textual_clue" and source_node_id == clue_group_id:
-            return (0, 0)
-        if role == "textual_clue" and source_node_id == active_focus_node_id:
-            return (4, 0)
-        if role == "drilldown" and (
-            source_node_id == active_focus_node_id
-            or parent_requirement_id == active_focus_requirement_id
-        ):
-            return (5, 0)
-        if role == "textual_clue":
-            return (6, 0)
-        if role == "related_entity":
-            related_score = score_related_entity_requirement(session, requirement, user_text) if session is not None else (0, 0, 0, 0, 0, 0)
-            return (8, *tuple(-int(part) for part in related_score))
-        if kind in {"query", "template", "analyze_vertical"}:
-            return (11, 0)
-        if kind == "analyze_horizontal":
-            return (12, 0)
-        if role == "drilldown" or source_node_id:
-            return (13, 0)
-        if kind == "schema":
-            return (14 if schema_deprioritized(requirement) else 2, 0)
-        if kind == "recall":
-            return (15, 0)
-        return (16, 0)
-
-    decorated: list[tuple[tuple[int, ...], dict[str, object]]] = []
-    for encounter_index, requirement in enumerate(requirements):
-        role = str(requirement.get("role", "")).strip().lower()
-        source_node_id = str(requirement.get("source_node_id", "")).strip()
-        group_order = encounter_index if role == "textual_clue" and source_node_id == clue_group_id else 0
-        decorated.append(((*role_priority(requirement), group_order, encounter_index), requirement))
-    decorated.sort(key=lambda item: item[0])
-    return [requirement for _, requirement in decorated]
 
 
 def normalize_text(text: str) -> str:
@@ -185,14 +36,6 @@ def normalize_text(text: str) -> str:
     for source, target in replacements.items():
         normalized = normalized.replace(source, target)
     return " ".join(normalized.split())
-
-
-def _textual_intent_requested(user_text: str) -> bool:
-    normalized = normalize_text(user_text)
-    if not normalized:
-        return False
-    terms = set(normalized.split())
-    return bool(terms & TEXTUAL_INTENT_TERMS)
 
 
 def is_short_confirmation(text: str) -> bool:
@@ -291,56 +134,6 @@ def _textual_columns_for_unit(session: "OrchestratorSession", unit_name: str) ->
         categorical_columns = [str(item) for item in classified.get("categorical_columns", [])]
         return text_columns, categorical_columns
     return raw_columns, raw_columns
-
-
-def score_related_entity_requirement(
-    session: "OrchestratorSession" | None,
-    requirement: dict[str, object],
-    user_text: str = "",
-) -> tuple[int, int, int, int, int, int]:
-    role = str(requirement.get("role", "")).strip().lower()
-    if role != "related_entity":
-        return (-1, -1, -1, -1, -1, -1)
-    target_units = requirement.get("units", [])
-    target_unit = str(target_units[0]).strip() if isinstance(target_units, list) and target_units else ""
-    text_columns: list[str] = []
-    categorical_columns: list[str] = []
-    if session is not None and target_unit:
-        text_columns, categorical_columns = _textual_columns_for_unit(session, target_unit)
-    normalized_columns = [normalize_text(column).replace(" ", "_") for column in text_columns + categorical_columns]
-    strong_text_columns = sum(
-        1
-        for column in normalized_columns
-        if any(token in column for token in TEXTUAL_COLUMN_TOKENS)
-    )
-    textual_columns = len(text_columns)
-    textual_intent = 1 if _textual_intent_requested(user_text) else 0
-    direct_key_relation = 0
-    suggested = requirement.get("suggested_action")
-    if isinstance(suggested, dict):
-        sql = str(suggested.get("suggested_sql", "")).strip().lower()
-        if " where " in sql and "=" in sql:
-            direct_key_relation = 1
-    source_from_textual_path = 1 if str(requirement.get("source_node_id", "")).strip() else 0
-    unexplored_target = 1
-    if session is not None and isinstance(suggested, dict):
-        action_payload = dict(suggested)
-        if already_executed(session, action_payload):
-            unexplored_target = 0
-    low_signal_penalty = 0
-    normalized_unit = normalize_text(target_unit).replace(" ", "_")
-    if strong_text_columns == 0 and any(token in normalized_unit for token in LOW_SIGNAL_LOG_TOKENS):
-        low_signal_penalty = 1
-    elif strong_text_columns == 0 and textual_columns == 0:
-        low_signal_penalty = 1
-    return (
-        textual_intent * strong_text_columns,
-        strong_text_columns,
-        textual_intent * textual_columns,
-        direct_key_relation + source_from_textual_path + unexplored_target,
-        textual_columns,
-        -low_signal_penalty,
-    )
 
 
 def _build_value_filter_sql(session: "OrchestratorSession", *, unit_name: str, column: str | None, value: str) -> str | None:
@@ -485,6 +278,303 @@ def _value_forms(value: str) -> list[str]:
     return forms
 
 
+def _quote_sql_identifier(identifier: str) -> str:
+    parts = []
+    for part in str(identifier).split("."):
+        part = part.strip()
+        if not part:
+            continue
+        escaped = part.replace('"', '""')
+        parts.append(f'"{escaped}"')
+    return ".".join(parts) if parts else '""'
+
+
+def _normalize_for_unit_matching(text: str) -> str:
+    normalized = normalize_text(text)
+    return re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+
+
+def _tokenize_for_unit_matching(text: str) -> list[str]:
+    return [token for token in _normalize_for_unit_matching(text).split() if token]
+
+
+def _longest_common_subsequence(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i, char_a in enumerate(a, start=1):
+        for j, char_b in enumerate(b, start=1):
+            if char_a == char_b:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = dp[i - 1][j] if dp[i - 1][j] >= dp[i][j - 1] else dp[i][j - 1]
+    return dp[-1][-1]
+
+
+def _is_similar_unit_token(text_token: str, unit_token: str) -> bool:
+    if not text_token or not unit_token:
+        return False
+    if text_token == unit_token or text_token in unit_token or unit_token in text_token:
+        return True
+    if text_token.endswith("s") and text_token[:-1] == unit_token:
+        return True
+    if unit_token.endswith("s") and unit_token[:-1] == text_token:
+        return True
+    lcs = _longest_common_subsequence(text_token, unit_token)
+    return lcs >= min(len(text_token), len(unit_token)) - 1
+
+
+def _find_mentioned_unit_approximate(text: str, unit_names: list[str]) -> str | None:
+    normalized_text = _normalize_for_unit_matching(text)
+    if not normalized_text:
+        return None
+    for unit_name in sorted(unit_names, key=len, reverse=True):
+        normalized_unit = _normalize_for_unit_matching(unit_name)
+        if normalized_unit and normalized_unit in normalized_text:
+            return unit_name
+    text_tokens = _tokenize_for_unit_matching(text)
+    if not text_tokens:
+        return None
+    candidates: list[tuple[int, int, str]] = []
+    for unit_name in unit_names:
+        unit_tokens = _tokenize_for_unit_matching(unit_name)
+        score = 0
+        for text_token in text_tokens:
+            for unit_token in unit_tokens:
+                if _is_similar_unit_token(text_token, unit_token):
+                    score += 1
+                    break
+        if score > 0:
+            candidates.append((score, len(unit_tokens), unit_name))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    if len(candidates) > 1 and (candidates[0][0] == candidates[1][0] or candidates[1][0] >= 90):
+        return None
+    return candidates[0][2]
+
+
+def _has_contextual_unit_evidence(session: "OrchestratorSession") -> bool:
+    if getattr(session, "_active_focus", None):
+        return True
+    graph = getattr(session, "knowledge_graph", None)
+    return bool(graph is not None and getattr(graph, "nodes", []))
+
+
+def _resolve_target_unit(session: "OrchestratorSession", user_text: str) -> str | None:
+    plausible_units = _recent_or_plausible_units(session)
+    if not plausible_units:
+        return None
+    target_unit = _find_mentioned_unit_approximate(user_text, plausible_units)
+    if target_unit is not None:
+        return target_unit
+    if len(plausible_units) == 1:
+        return plausible_units[0]
+    if _has_contextual_unit_evidence(session):
+        return plausible_units[0]
+    return None
+
+
+def _column_tokens(text: str) -> list[str]:
+    normalized = normalize_text(str(text).replace("_", " "))
+    return [token for token in re.sub(r"[^a-z0-9]+", " ", normalized).split() if token]
+
+
+def _singularize_token(token: str) -> str:
+    return token[:-1] if len(token) > 3 and token.endswith("s") else token
+
+
+def _normalize_dimension_phrase(text: str) -> str:
+    normalized = normalize_text(text).strip(" ,.:!?")
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _extract_dimension_phrase(user_text: str) -> str | None:
+    match = re.search(
+        r"(?:\bcontagem\s+por\b|\bcontar\s+por\b|\bquantidade\s+por\b|\btotal\s+por\b|\bdistribuicao\s+por\b|\bagrupar\s+por\b|\bgroup\s+by\b|\bcount\s+by\b)\s+(.+)$",
+        normalize_text(user_text),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    dimension = _normalize_dimension_phrase(match.group(1))
+    return dimension or None
+
+
+def _columns_for_unit(session: "OrchestratorSession", unit_name: str) -> list[str]:
+    try:
+        structure = session._find_unit(unit_name).get_structure()
+    except Exception:
+        return []
+    columns: list[str] = []
+    for column in getattr(structure, "columns", ()) or ():
+        name = str(getattr(column, "name", "")).strip()
+        if name and name not in columns:
+            columns.append(name)
+    return columns
+
+
+def _resolve_dimension_column(session: "OrchestratorSession", unit_name: str, dimension_text: str) -> str | None:
+    columns = _columns_for_unit(session, unit_name)
+    if not columns:
+        return None
+    phrase = _normalize_dimension_phrase(dimension_text)
+    if not phrase:
+        return None
+    phrase_tokens = [_singularize_token(token) for token in _column_tokens(phrase)]
+    if not phrase_tokens:
+        return None
+    canonical_phrase = "".join(phrase_tokens)
+    candidates: list[tuple[int, int, int, str]] = []
+    for column in columns:
+        column_tokens = [_singularize_token(token) for token in _column_tokens(column)]
+        if not column_tokens:
+            continue
+        canonical_column = "".join(column_tokens)
+        score = 0
+        matched_tokens = 0
+        if canonical_phrase == canonical_column:
+            score = 100
+            matched_tokens = len(phrase_tokens)
+        elif canonical_phrase in canonical_column or canonical_column in canonical_phrase:
+            score = 90
+            matched_tokens = len(phrase_tokens)
+        else:
+            for phrase_token in phrase_tokens:
+                for column_token in column_tokens:
+                    if _is_similar_unit_token(phrase_token, column_token):
+                        matched_tokens += 1
+                        break
+            if matched_tokens == len(phrase_tokens):
+                score = 60 + matched_tokens
+            elif len(phrase_tokens) == 1 and matched_tokens == 1:
+                score = 40
+        if score > 0:
+            candidates.append((score, matched_tokens, len(column_tokens), column))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+    if len(candidates) > 1 and (
+        candidates[0][0] == candidates[1][0]
+        or (candidates[0][1] == len(phrase_tokens) and candidates[1][1] == len(phrase_tokens))
+    ):
+        return None
+    return candidates[0][3]
+
+
+def plan_grouped_count_by_dimension(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
+    normalized_text = normalize_text(user_text)
+    if not normalized_text or _schema_requested_explicitly(normalized_text):
+        return None
+    dimension_text = _extract_dimension_phrase(user_text)
+    if not dimension_text:
+        return None
+    unit_name = _resolve_target_unit(session, user_text)
+    if not unit_name:
+        return None
+    column_name = _resolve_dimension_column(session, unit_name, dimension_text)
+    if not column_name:
+        return None
+    quoted_unit = _quote_sql_identifier(unit_name)
+    quoted_column = _quote_sql_identifier(column_name)
+    sql = (
+        f"SELECT {quoted_column} AS value, COUNT(*) AS total "
+        f"FROM {quoted_unit} "
+        f"GROUP BY {quoted_column} "
+        f"ORDER BY total DESC "
+        f"LIMIT 50"
+    )
+    validated_sql = _validate_generated_select_sql(sql)
+    if validated_sql is None:
+        return None
+    upper = validated_sql.upper()
+    invalid_patterns = ("SELECT FROM", "SELECT ,", "GROUP BY ORDER", "; LIMIT", "FROM  GROUP")
+    if "GROUP BY" not in upper or "COUNT(" not in upper or "LIMIT" not in upper:
+        return None
+    if any(pattern in upper for pattern in invalid_patterns):
+        return None
+    return {
+        "action": "request_new_query",
+        "description": f"agrupar contagem por {column_name} em {unit_name}",
+        "suggested_sql": validated_sql,
+    }
+
+
+def plan_count_records_command(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
+    normalized_text = normalize_text(user_text)
+    if not normalized_text or _schema_requested_explicitly(normalized_text):
+        return None
+    if _extract_dimension_phrase(user_text):
+        return None
+    triggers = ("quantos", "quantas", "total", "contagem", "count", "number of", "how many")
+    if not any(token in normalized_text for token in triggers):
+        return None
+    target_unit = _resolve_target_unit(session, user_text)
+    if target_unit is None:
+        return None
+    quoted_unit = _quote_sql_identifier(target_unit)
+    return {
+        "action": "request_new_query",
+        "description": f"Contar registros em {target_unit}",
+        "suggested_sql": f"SELECT COUNT(*) AS total FROM {quoted_unit};",
+    }
+
+
+def _rank_search_terms_for_filtering(search_terms: list[str]) -> list[str]:
+    if not search_terms:
+        return []
+    singular_candidates: list[str] = []
+    for term in search_terms:
+        if " " not in term and term.endswith("s") and term[:-1] in search_terms:
+            singular_candidates.append(term[:-1])
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for term in search_terms:
+        if term in singular_candidates and term not in seen:
+            ranked.append(term)
+            seen.add(term)
+    best_phrase: str | None = None
+    for term in search_terms:
+        words = term.split()
+        if len(words) == 2 and term not in seen:
+            plural_count = sum(1 for word in words if word.endswith("s"))
+            if best_phrase is None:
+                best_phrase = term
+            else:
+                existing_plural_count = sum(1 for word in best_phrase.split() if word.endswith("s"))
+                if plural_count < existing_plural_count:
+                    best_phrase = term
+    if best_phrase is not None and best_phrase not in seen:
+        ranked.append(best_phrase)
+        seen.add(best_phrase)
+    for term in search_terms:
+        if term not in seen and " " not in term:
+            ranked.append(term)
+            seen.add(term)
+    for term in search_terms:
+        if term not in seen and len(term.split()) == 2:
+            ranked.append(term)
+            seen.add(term)
+    for term in search_terms:
+        if term not in seen:
+            ranked.append(term)
+    return ranked
+
+
+def _select_independent_filter_terms(ranked_terms: list[str]) -> list[str]:
+    selected: list[str] = []
+    used_tokens: set[str] = set()
+    for term in ranked_terms:
+        term_tokens = {
+            token[:-1] if len(token) > 3 and token.endswith("s") else token
+            for token in term.split()
+        }
+        if not term_tokens & used_tokens:
+            selected.append(term)
+            used_tokens.update(term_tokens)
+    return selected
+
+
 def _search_terms_from_free_text(user_text: str) -> list[str]:
     normalized = normalize_text(user_text)
     words = [word for word in normalized.split() if word]
@@ -501,99 +591,17 @@ def _search_terms_from_free_text(user_text: str) -> list[str]:
     return terms
 
 
-def _rank_search_terms_for_filtering(search_terms: list[str]) -> list[str]:
-    normalized_terms = [normalize_text(term) for term in search_terms if normalize_text(term)]
-    observed_terms = set(normalized_terms)
-    singular_terms: list[str] = []
-    preferred_two_word_terms: list[str] = []
-    secondary_two_word_terms: list[str] = []
-    single_word_terms: list[str] = []
-    other_multi_word_terms: list[str] = []
-    full_length_terms: list[str] = []
-    max_word_count = max((len(term.split()) for term in normalized_terms), default=0)
-    seen: set[str] = set()
-
-    for term in normalized_terms:
-        if term in seen:
-            continue
-        seen.add(term)
-        word_count = len(term.split())
-        is_simple_singular = word_count == 1 and len(term) > 2 and not term.endswith("s") and f"{term}s" in observed_terms
-        if is_simple_singular:
-            singular_terms.append(term)
-        elif word_count == 2:
-            first_word = term.split()[0]
-            if len(first_word) > 3 and first_word.endswith("s"):
-                secondary_two_word_terms.append(term)
-            else:
-                preferred_two_word_terms.append(term)
-        elif word_count == 1:
-            single_word_terms.append(term)
-        elif word_count == max_word_count and word_count >= 3:
-            full_length_terms.append(term)
-        else:
-            other_multi_word_terms.append(term)
-
-    ranked: list[str] = []
-    for bucket in (singular_terms, preferred_two_word_terms, single_word_terms, secondary_two_word_terms, other_multi_word_terms, full_length_terms):
-        for term in bucket:
-            if term not in ranked:
-                ranked.append(term)
-    return ranked
-
-
-def _select_independent_filter_terms(ranked_terms: list[str]) -> list[str]:
-    normalized_terms = [normalize_text(term) for term in ranked_terms if normalize_text(term)]
-    observed_terms = set(normalized_terms)
-    selected: list[str] = []
-
-    def _is_simple_singular(term: str) -> bool:
-        return len(term.split()) == 1 and len(term) > 2 and not term.endswith("s") and f"{term}s" in observed_terms
-
-    for term in normalized_terms:
-        if term in selected:
-            continue
-        if len(selected) >= 3:
-            break
-        term_tokens = set(term.split())
-        if len(term.split()) == 1 and len(term) > 3 and term.endswith("s") and term[:-1] in selected:
-            continue
-        if len(term.split()) > 1:
-            skip_term = False
-            for chosen in selected:
-                chosen_tokens = set(chosen.split())
-                if len(chosen.split()) > 1 and term_tokens & chosen_tokens:
-                    skip_term = True
-                    break
-                if len(chosen.split()) == 1 and (chosen in term_tokens or f"{chosen}s" in term_tokens):
-                    skip_term = True
-                    break
-            if skip_term:
-                continue
-        if len(term.split()) == 1 and any(term in chosen.split() for chosen in selected if len(chosen.split()) > 1):
-            if not _is_simple_singular(term):
-                continue
-        if len(term.split()) > 1:
-            selected = [chosen for chosen in selected if chosen not in term.split() or _is_simple_singular(chosen)]
-        selected.append(term)
-    return selected
-
-
-def _sanitize_select_clause(select_clause: str) -> str:
-    columns = [column.strip() for column in str(select_clause).split(",") if column.strip()]
-    if not columns:
-        return "*"
-    return ", ".join(columns)
-
-
 def plan_multi_value_filter(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
     normalized_user_text = normalize_text(user_text)
     if not normalized_user_text or _schema_requested_explicitly(normalized_user_text):
+        return None
+    if _extract_dimension_phrase(user_text):
         return None
     search_terms = _search_terms_from_free_text(user_text)
     if len(search_terms) < 2:
         return None
     ranked_terms = _rank_search_terms_for_filtering(search_terms)
+    independent_terms = _select_independent_filter_terms(ranked_terms)
     observed_candidates = _extract_observed_candidates_from_sample_entities(session) + _extract_observed_candidates_from_cache(session)
     unit_matches: dict[str, list[dict[str, str]]] = {}
     seen_matches: set[tuple[str, str, str]] = set()
@@ -621,20 +629,17 @@ def plan_multi_value_filter(session: "OrchestratorSession", user_text: str) -> d
         select_clause = "*"
         if callable(builder):
             try:
-                select_clause = _sanitize_select_clause(str(builder(unit_name, "")))
+                select_clause = str(builder(unit_name, ""))
             except Exception:
                 select_clause = "*"
-        conditions = [f"LOWER(CAST({column} AS TEXT)) = LOWER({_quote_sql_literal(value)})" for column, value in by_column.items()]
-        sql = build_safe_select_sql(unit_name, [select_clause], conditions, mode="AND", limit=50)
-        if not sql:
-            continue
-        validated_sql = _validate_generated_select_sql(sql)
-        if not validated_sql:
-            continue
+        where_clause = " AND ".join(
+            f"LOWER(CAST({column} AS TEXT)) = LOWER({_quote_sql_literal(value)})"
+            for column, value in by_column.items()
+        )
         return {
             "action": "request_new_query",
             "description": "amostrar registros filtrados por multiplos valores observados",
-            "suggested_sql": validated_sql,
+            "suggested_sql": f"SELECT {select_clause} FROM {unit_name} WHERE {where_clause} LIMIT 50",
         }
     recent_units = _recent_or_plausible_units(session)
     if not recent_units:
@@ -651,31 +656,138 @@ def plan_multi_value_filter(session: "OrchestratorSession", user_text: str) -> d
     select_clause = "*"
     if callable(builder):
         try:
-            select_clause = _sanitize_select_clause(str(builder(unit_name, "")))
+            select_clause = str(builder(unit_name, ""))
         except Exception:
             select_clause = "*"
-    selected_terms = _select_independent_filter_terms(ranked_terms)
-    groups: list[str] = []
-    for term in selected_terms:
+    grouped_clauses: list[str] = []
+    for term in independent_terms[:2]:
         quoted = _quote_sql_literal(term)
-        group_clauses: list[str] = []
-        for column in candidate_columns[:4]:
-            group_clauses.append(f"LOWER(CAST({column} AS TEXT)) = LOWER({quoted})")
-        if group_clauses:
-            groups.append("(" + " OR ".join(group_clauses) + ")")
-    if not groups:
-        return None
-    sql = build_safe_select_sql(unit_name, [select_clause], groups, mode="AND", limit=50)
-    if not sql:
-        return None
-    validated_sql = _validate_generated_select_sql(sql)
-    if not validated_sql:
+        term_clauses = [f"LOWER(CAST({column} AS TEXT)) = LOWER({quoted})" for column in candidate_columns[:4]]
+        if term_clauses:
+            grouped_clauses.append(f"({' OR '.join(term_clauses)})")
+    if not grouped_clauses:
         return None
     return {
         "action": "request_new_query",
         "description": "amostrar registros filtrados por multiplos valores",
-        "suggested_sql": validated_sql,
+        "suggested_sql": f"SELECT {select_clause} FROM {unit_name} WHERE {' AND '.join(grouped_clauses)} LIMIT 50",
     }
+
+
+def _validate_generated_select_sql(sql: str) -> str | None:
+    try:
+        from orchestrator import validate_select_sql_text
+
+        normalized = validate_select_sql_text(sql)
+    except Exception:
+        return None
+    upper = normalized.upper()
+    if (
+        "SELECT FROM" in upper
+        or "SELECT ," in upper
+        or "WHERE LIMIT" in upper
+        or "FROM  WHERE" in upper
+        or "GROUP BY ORDER" in upper
+        or "; LIMIT" in upper
+        or "FROM  GROUP" in upper
+    ):
+        return None
+    if "FROM" not in upper:
+        return None
+    return normalized
+
+
+def focused_pending_requirements(session: "OrchestratorSession") -> list[dict[str, object]]:
+    graph = getattr(session, "knowledge_graph", None)
+    if graph is None:
+        return []
+    active_focus = getattr(session, "_active_focus", None) or {}
+    pending: list[dict[str, object]] = []
+    for node in reversed(getattr(graph, "nodes", [])):
+        for requirement in getattr(node, "next_requirements", []) or []:
+            if str(requirement.get("status", "")).strip().lower() != "pending":
+                continue
+            pending.append(requirement)
+    return sort_pending_requirements_for_investigation(pending, active_focus=active_focus)
+
+
+def _extract_selected_columns_from_sql(sql: str) -> list[str]:
+    match = re.search(r"SELECT\s+(.+?)\s+FROM", sql, flags=re.IGNORECASE)
+    if not match:
+        return []
+    clause = match.group(1)
+    return [column.strip().split()[-1] for column in clause.split(",") if column.strip()]
+
+
+def score_related_entity_requirement(session: "OrchestratorSession", requirement: dict[str, object], user_text: str) -> int:
+    score = 0
+    role = str(requirement.get("role", "")).strip().lower()
+    if role == "related_entity":
+        score += 10
+    normalized_text = normalize_text(user_text)
+    units = requirement.get("units") if isinstance(requirement.get("units"), list) else []
+    if units:
+        target = _find_mentioned_unit_approximate(user_text, [str(units[0])])
+        if target:
+            score += 20
+    suggested_sql = str(requirement.get("suggested_action", {}).get("suggested_sql", ""))
+    for column in _extract_selected_columns_from_sql(suggested_sql):
+        if normalize_text(column) in normalized_text:
+            score += 20
+        if normalize_text(column).endswith("id"):
+            score += 1
+        if normalize_text(column) in {"transcript", "description", "statement", "notes"}:
+            score += 5
+    if any(keyword in normalized_text for keyword in ("entrevista", "entrevistas", "depoimento", "testemunha", "testemunhas")):
+        if "transcript" in suggested_sql.lower() or "witness" in " ".join(str(unit).lower() for unit in units):
+            score += 20
+    return score
+
+
+def plan_filter_for_observed_value(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
+    normalized_user_text = normalize_text(user_text)
+    if not normalized_user_text or _schema_requested_explicitly(normalized_user_text):
+        return None
+    triggers = ("foc", "aprofund", "consult", "filtr", "buscar", "ver", "investig")
+    if not any(token in normalized_user_text for token in triggers) and not normalized_user_text.startswith("sim "):
+        return None
+    candidates = _extract_observed_candidates_from_sample_entities(session) + _extract_observed_candidates_from_cache(session)
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        unit_name = str(candidate.get("unit", "")).strip()
+        column = str(candidate.get("column", "")).strip()
+        value = str(candidate.get("value", "")).strip()
+        key = (unit_name, column, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        if normalize_text(value) not in normalized_user_text:
+            continue
+        sql = _build_value_filter_sql(session, unit_name=unit_name, column=column or None, value=value)
+        if not sql:
+            continue
+        return {
+            "action": "request_new_query",
+            "description": f"filtrar registros por valor observado em {column or unit_name}",
+            "suggested_sql": sql,
+        }
+    active_focus = getattr(session, "_active_focus", None)
+    if isinstance(active_focus, dict):
+        filter_payload = active_focus.get("filter")
+        units = active_focus.get("units", [])
+        if isinstance(filter_payload, dict) and isinstance(units, list) and units:
+            value = str(filter_payload.get("value", "")).strip()
+            column = str(filter_payload.get("column", "")).strip()
+            unit_name = str(units[0]).strip()
+            if value and normalize_text(value) in normalized_user_text:
+                sql = _build_value_filter_sql(session, unit_name=unit_name, column=column or None, value=value)
+                if sql:
+                    return {
+                        "action": "request_new_query",
+                        "description": f"filtrar registros por valor observado em {column or unit_name}",
+                        "suggested_sql": sql,
+                    }
+    return None
 
 
 def _recent_or_plausible_units(session: "OrchestratorSession") -> list[str]:
@@ -713,31 +825,61 @@ def _direct_search_sql(session: "OrchestratorSession", *, unit_name: str, value:
     if not candidate_columns:
         return None
     quoted_value = _quote_sql_literal(value)
-    clauses = [f"CAST({column} AS TEXT) = {quoted_value}" for column in candidate_columns[:4]]
+    clauses = [f"LOWER(CAST({column} AS TEXT)) = LOWER({quoted_value})" for column in candidate_columns[:4]]
     if not clauses:
         return None
     return f"SELECT {select_clause} FROM {unit_name} WHERE {' OR '.join(clauses)} LIMIT 50"
 
 
-def _validate_generated_select_sql(sql: str) -> str | None:
-    normalized = " ".join(str(sql).strip().split())
-    if not normalized:
+def _numeric_option_payload(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
+    stripped = user_text.strip()
+    if not stripped.isdigit():
         return None
-    upper = normalized.upper()
-    invalid_patterns = ("SELECT FROM", "SELECT ,", ", FROM", "WHERE LIMIT", "FROM WHERE", "WHERE ) LIMIT")
-    if not upper.startswith("SELECT ") or " FROM " not in upper or " WHERE " not in upper or " LIMIT " not in upper:
+    options = getattr(session, "_last_presented_options", None)
+    if not isinstance(options, list):
         return None
-    if any(pattern in upper for pattern in invalid_patterns):
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        if int(option.get("index", -1)) != int(stripped):
+            continue
+        option_text = str(option.get("text", "")).strip()
+        if not option_text:
+            return None
+        return plan_filter_for_observed_value(session, option_text)
+    return None
+
+
+def _best_pending_requirement(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
+    pending = focused_pending_requirements(session)
+    if not pending:
         return None
-    try:
-        from orchestrator import validate_select_sql_text
-    except Exception:
-        return normalized
-    try:
-        validated = validate_select_sql_text(normalized)
-    except Exception:
+    normalized_text = normalize_text(user_text)
+    textual_intent = any(keyword in normalized_text for keyword in ("entrevista", "entrevistas", "depoimento", "depoimentos", "testemunha", "testemunhas"))
+    if textual_intent:
+        scored: list[tuple[int, dict[str, object]]] = []
+        for requirement in pending:
+            if str(requirement.get("role", "")).strip().lower() != "related_entity":
+                continue
+            score = score_related_entity_requirement(session, requirement, user_text)
+            if score > 10:
+                scored.append((score, requirement))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            return scored[0][1]
         return None
-    return " ".join(str(validated).strip().split())
+    def fallback_sort_key(requirement: dict[str, object]) -> tuple[int, int, str]:
+        kind = str(requirement.get("kind", "")).strip().lower()
+        role = str(requirement.get("role", "")).strip().lower()
+        kind_score = 0 if kind == "query" else 1 if kind == "analyze_horizontal" else 2 if kind == "schema" else 3
+        role_score = 0 if role == "textual_clue" else 1 if role == "related_entity" else 2 if role == "drilldown" else 3
+        return (kind_score, role_score, str(requirement.get("id", "")).strip())
+
+    for requirement in sorted(pending, key=fallback_sort_key):
+        payload = _action_from_requirement(requirement)
+        if payload is not None and not already_executed(session, payload):
+            return requirement
+    return None
 
 
 def plan_direct_value_command(session: "OrchestratorSession", user_text: str) -> dict[str, object] | None:
@@ -785,140 +927,30 @@ def plan_direct_value_command(session: "OrchestratorSession", user_text: str) ->
                 }
     return None
 
-
 def first_pending_requirement(graph) -> dict[str, object] | None:
     if graph is None:
         return None
-    pending = getattr(graph, "pending_requirements", lambda: [])()
+    pending = graph.pending_requirements() if hasattr(graph, "pending_requirements") else []
     if not pending:
         return None
-    return pending[0]
 
+    def requirement_sort_key(requirement: dict[str, object]) -> tuple[int, int, int]:
+        role = str(requirement.get("role", "")).strip().lower()
+        role_score = 0 if role == "textual_clue" else 1 if role == "related_entity" else 2 if role == "drilldown" else 3
+        source_node_id = str(requirement.get("source_node_id", "")).strip()
+        derived_score = 0 if source_node_id else 1
+        kind = str(requirement.get("kind", "")).strip().lower()
+        kind_score = 0 if kind == "query" else 1 if kind == "analyze_horizontal" else 2 if kind == "recall" else 3
+        return (role_score, derived_score, kind_score)
 
-def _best_related_entity_requirement(
-    session: "OrchestratorSession",
-    requirements: list[dict[str, object]],
-    user_text: str,
-) -> dict[str, object] | None:
-    candidates: list[dict[str, object]] = []
-    for requirement in requirements:
-        if str(requirement.get("role", "")).strip().lower() != "related_entity":
-            continue
-        payload = _action_from_requirement(requirement)
-        if payload is None or already_executed(session, payload):
-            continue
-        candidates.append(requirement)
-    if not candidates:
-        return None
-    ranked = sorted(
-        candidates,
-        key=lambda requirement: score_related_entity_requirement(session, requirement, user_text),
-        reverse=True,
-    )
-    best = ranked[0]
-    best_score = score_related_entity_requirement(session, best, user_text)
-    if _textual_intent_requested(user_text) and best_score[:3] <= (0, 0, 0):
-        return None
-    if best_score <= (0, 0, 0, 0, 0, 0):
-        return None
-    return best
-
-
-def _first_available_requirement_action(
-    session: "OrchestratorSession",
-    requirements: list[dict[str, object]],
-    *,
-    user_text: str = "",
-) -> dict[str, object] | None:
-    explicit_schema = _schema_requested_explicitly(normalize_text(user_text))
-    deferred_schema: list[dict[str, object]] = []
-    for requirement in requirements:
-        payload = _action_from_requirement(requirement)
-        if payload is None or str(payload.get("action", "")).strip() == "tables":
-            continue
-        if already_executed(session, payload):
-            continue
-        if (
-            not explicit_schema
-            and str(requirement.get("kind", "")).strip().lower() == "schema"
-            and any(
-                str(candidate.get("kind", "")).strip().lower() != "schema"
-                and _action_from_requirement(candidate) is not None
-                and not already_executed(session, _action_from_requirement(candidate) or {})
-                for candidate in requirements
-            )
-        ):
-            deferred_schema.append(requirement)
-            continue
-        return payload
-    for requirement in deferred_schema:
-        payload = _action_from_requirement(requirement)
-        if payload is not None and not already_executed(session, payload):
-            return payload
-    return None
-
-
-def get_structured_option(session: "OrchestratorSession", index: int) -> dict[str, object] | None:
-    options = getattr(session, "_last_presented_options", None)
-    if not isinstance(options, list) or index <= 0:
-        return None
-    for option in options:
-        if isinstance(option, dict) and int(option.get("index", -1)) == index:
-            return dict(option)
-    return None
-
-
-def _structured_option_to_action(session: "OrchestratorSession", option: dict[str, object]) -> dict[str, object] | None:
-    suggested_action = option.get("suggested_action")
-    if isinstance(suggested_action, dict):
-        return dict(suggested_action)
-    option_text = str(option.get("text", "")).strip()
-    if not option_text:
-        return None
-    normalized = normalize_text(option_text)
-    if any(token in normalized for token in ("cruz", "juntar", "relacionar", "conectar")):
-        return None
-    observed_value_action = plan_filter_for_observed_value(session, option_text)
-    if observed_value_action is not None:
-        return observed_value_action
-    direct_value_action = plan_direct_value_command(session, option_text)
-    if direct_value_action is not None:
-        return direct_value_action
-    return None
-
-
-def focused_pending_requirements(session: "OrchestratorSession") -> list[dict[str, object]]:
-    graph = getattr(session, "knowledge_graph", None)
-    active_focus = getattr(session, "_active_focus", None)
-    if graph is None or not isinstance(active_focus, dict):
-        return []
-    node_id = str(active_focus.get("node_id", "")).strip()
-    source_requirement_id = str(active_focus.get("source_requirement_id", "")).strip()
-    clue_group_id = str(active_focus.get("clue_group_id", "")).strip()
-    if not node_id and not source_requirement_id:
-        return []
-    focused: list[tuple[int, int, dict[str, object]]] = []
-    for node_index, node in enumerate(getattr(graph, "nodes", [])):
-        for req_index, requirement in enumerate(getattr(node, "next_requirements", [])):
-            if str(requirement.get("status", "")).strip() != "pending":
-                continue
-            req_node_id = str(requirement.get("source_node_id", "")).strip()
-            parent_requirement_id = str(requirement.get("parent_requirement_id", "")).strip()
-            role = str(requirement.get("role", "")).strip().lower()
-            if (
-                req_node_id == node_id
-                or parent_requirement_id == source_requirement_id
-                or role in {"drilldown", "textual_clue"}
-                or req_node_id
-            ):
-                focused.append((node_index, req_index, requirement))
-
-    return sort_pending_requirements_for_investigation(
-        [requirement for _, _, requirement in focused],
-        active_focus=active_focus,
-        session=session,
-        user_text="",
-    )
+    best_requirement = pending[0]
+    best_key = requirement_sort_key(best_requirement)
+    for requirement in pending[1:]:
+        current_key = requirement_sort_key(requirement)
+        if current_key < best_key:
+            best_requirement = requirement
+            best_key = current_key
+    return best_requirement
 
 
 def mark_requirement_resolved(graph, requirement_id: str) -> bool:
@@ -967,9 +999,6 @@ def _action_from_requirement(requirement: dict[str, object]) -> dict[str, object
     if requirement_id:
         payload["__requirement_id"] = requirement_id
         payload["_source_requirement_id"] = requirement_id
-    source_node_id = str(requirement.get("source_node_id", "")).strip()
-    if source_node_id:
-        payload["_requirement_source_node_id"] = source_node_id
     return payload
 
 
@@ -993,6 +1022,12 @@ def plan_deterministic_action(
             "suggested_sql": stripped,
         }
 
+    requirement = _best_pending_requirement(session, stripped)
+    if is_short_confirmation(stripped) and requirement is not None:
+        payload = _action_from_requirement(requirement)
+        if payload is not None and not already_executed(session, payload):
+            return payload
+
     if normalized in {"tabelas", "tables"}:
         return {"action": "tables"}
 
@@ -1001,22 +1036,13 @@ def plan_deterministic_action(
         if unit_name:
             return {"action": "schema", "table": unit_name}
 
-    if _textual_intent_requested(stripped):
-        focus_requirements = focused_pending_requirements(session)
-        all_pending = getattr(graph, "pending_requirements", lambda **kwargs: [])(
-            active_focus=getattr(session, "_active_focus", None)
-        )
-        related_requirement = _best_related_entity_requirement(
-            session,
-            focus_requirements or all_pending,
-            stripped,
-        )
-        if related_requirement is None:
-            related_requirement = _best_related_entity_requirement(session, all_pending, stripped)
-        if related_requirement is not None:
-            payload = _action_from_requirement(related_requirement)
-            if payload is not None and str(payload.get("action", "")).strip() != "tables":
-                return payload
+    grouped_count_action = plan_grouped_count_by_dimension(session, stripped)
+    if grouped_count_action is not None and not already_executed(session, grouped_count_action):
+        return grouped_count_action
+
+    count_action = plan_count_records_command(session, stripped)
+    if count_action is not None and not already_executed(session, count_action):
+        return count_action
 
     direct_value_action = plan_direct_value_command(session, stripped)
     if direct_value_action is not None and not already_executed(session, direct_value_action):
@@ -1026,34 +1052,13 @@ def plan_deterministic_action(
     if observed_value_action is not None and not already_executed(session, observed_value_action):
         return observed_value_action
 
+    numeric_option_action = _numeric_option_payload(session, stripped)
+    if numeric_option_action is not None and not already_executed(session, numeric_option_action):
+        return numeric_option_action
+
     multi_value_action = plan_multi_value_filter(session, stripped)
     if multi_value_action is not None and not already_executed(session, multi_value_action):
         return multi_value_action
-
-    if normalized in {"1", "2", "3", "4", "5"}:
-        option = get_structured_option(session, int(normalized))
-        if option:
-            action = _structured_option_to_action(session, option)
-            if action is not None and not already_executed(session, action):
-                return action
-        return None
-
-    focus_requirements = focused_pending_requirements(session)
-    all_pending_requirements = getattr(graph, "pending_requirements", lambda **kwargs: [])(
-        active_focus=getattr(session, "_active_focus", None)
-    )
-    requirement = focus_requirements[0] if focus_requirements else first_pending_requirement(graph)
-    if is_short_confirmation(stripped):
-        for requirement_pool in (focus_requirements, all_pending_requirements):
-            if not requirement_pool:
-                continue
-            payload = _first_available_requirement_action(
-                session,
-                requirement_pool,
-                user_text=stripped,
-            )
-            if payload is not None:
-                return payload
 
     if any(token in normalized for token in ("explorar", "analisar", "investigar", "ver", "aprofundar")):
         unit_name = find_mentioned_unit(stripped, unit_names)
@@ -1070,15 +1075,15 @@ def plan_deterministic_action(
                 return payload
 
     if requirement is not None and _is_continuation(stripped):
-        for requirement_pool in (focus_requirements, all_pending_requirements):
-            if not requirement_pool:
-                continue
-            payload = _first_available_requirement_action(
-                session,
-                requirement_pool,
-                user_text=stripped,
-            )
-            if payload is not None:
-                return payload
+        payload = _action_from_requirement(requirement)
+        if payload is not None and not already_executed(session, payload):
+            return payload
+
+    if requirement is not None and any(
+        keyword in normalized for keyword in ("entrevista", "entrevistas", "depoimento", "depoimentos", "testemunha", "testemunhas")
+    ):
+        payload = _action_from_requirement(requirement)
+        if payload is not None and not already_executed(session, payload):
+            return payload
 
     return None

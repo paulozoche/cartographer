@@ -13,10 +13,10 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from agnostic.ai.ports.ai_orchestrator import AIResponse
+from agnostic.application.planning.requirement_priority import sort_pending_requirements_for_investigation
 from agnostic.application.planning.rule_based_planner import (
     extract_units_from_sql,
     plan_deterministic_action,
-    sort_pending_requirements_for_investigation,
 )
 from agnostic.config import load_app_config
 from agnostic.domain.analysis.analyze_tabular_unit import analyze_tabular_unit
@@ -146,20 +146,6 @@ class KnowledgeGraph:
         else:
             for edge in self.edges:
                 lines.append(f"- {edge.from_id} -> {edge.relation} -> {edge.to_id}")
-        # Resolved requirements
-        lines.extend(["", "### Requisitos Resolvidos"])
-        resolved: list[dict[str, object]] = []
-        for node in self.nodes:
-            for requirement in node.next_requirements:
-                if str(requirement.get("status", "")).strip() == "resolved":
-                    resolved.append(requirement)
-        if not resolved:
-            lines.append("- Nenhum requisito resolvido.")
-        else:
-            for requirement in resolved:
-                units = ", ".join(str(unit) for unit in requirement.get("units", []))
-                lines.append(f"- {requirement.get('id', '')} [{requirement.get('kind', '')}] units={units}: {requirement.get('description', '')}")
-
         lines.extend(["", "### Requisitos Pendentes"])
         pending = self.pending_requirements()
         if not pending:
@@ -172,28 +158,14 @@ class KnowledgeGraph:
                 )
         return "\n".join(lines)
 
-    def pending_requirements(self, *, active_focus: dict[str, object] | None = None) -> list[dict[str, object]]:
+    def pending_requirements(self, active_focus: dict[str, object] | None = None) -> list[dict[str, object]]:
         pending: list[dict[str, object]] = []
-        resolved_ids = {
-            str(requirement.get("id", "")).strip()
-            for node in self.nodes
-            for requirement in node.next_requirements
-            if str(requirement.get("status", "")).strip() == "resolved" and str(requirement.get("id", "")).strip()
-        }
-        seen_ids: set[str] = set()
-        # iterate nodes in reverse to prioritize recent nodes first
-        for node in reversed(self.nodes):
+        for node in sorted(self.nodes, key=lambda node: str(node.timestamp), reverse=True):
             for requirement in node.next_requirements:
-                requirement_id = str(requirement.get("id", "")).strip()
-                if requirement_id and requirement_id in resolved_ids:
+                if str(requirement.get("status", "")).strip().lower() != "pending":
                     continue
-                if requirement_id and requirement_id in seen_ids:
-                    continue
-                if requirement_id:
-                    seen_ids.add(requirement_id)
-                if str(requirement.get("status", "")).strip() == "pending":
-                    pending.append(requirement)
-        return sort_pending_requirements_for_investigation(pending, active_focus=active_focus, graph=self)
+                pending.append(requirement)
+        return sort_pending_requirements_for_investigation(pending, active_focus=active_focus)
 
     def mark_requirement_resolved(self, requirement_id: str) -> bool:
         for node in self.nodes:
@@ -202,13 +174,6 @@ class KnowledgeGraph:
                     requirement["status"] = "resolved"
                     return True
         return False
-
-    def find_requirement(self, requirement_id: str) -> tuple[KnowledgeNode, dict[str, object]] | None:
-        for node in self.nodes:
-            for requirement in node.next_requirements:
-                if requirement.get("id") == requirement_id:
-                    return node, requirement
-        return None
 
 
 class DeepSeekClient:
@@ -306,8 +271,6 @@ class OrchestratorSession:
         self._session_query_catalog: dict[str, str] = {}
         self._candidate_queries: list[tuple[str, str]] = []
         self._execution_log: list[dict[str, str]] = []
-        self._active_focus: dict[str, object] | None = None
-        self._last_presented_options: list[dict[str, object]] = []
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY não encontrada. Verifique o arquivo .env.")
@@ -739,30 +702,7 @@ class OrchestratorSession:
 
     def pending_requirements(self) -> list[dict[str, object]]:
         graph = getattr(self, "knowledge_graph", KnowledgeGraph())
-        pending: list[dict[str, object]] = []
-        resolved_ids = {
-            str(requirement.get("id", "")).strip()
-            for node in getattr(graph, "nodes", [])
-            for requirement in getattr(node, "next_requirements", [])
-            if str(requirement.get("status", "")).strip() == "resolved" and str(requirement.get("id", "")).strip()
-        }
-        seen_ids: set[str] = set()
-        for node in reversed(getattr(graph, "nodes", [])):
-            for requirement in getattr(node, "next_requirements", []):
-                requirement_id = str(requirement.get("id", "")).strip()
-                if requirement_id and requirement_id in resolved_ids:
-                    continue
-                if requirement_id and requirement_id in seen_ids:
-                    continue
-                if requirement_id:
-                    seen_ids.add(requirement_id)
-                if str(requirement.get("status", "")).strip() == "pending":
-                    pending.append(requirement)
-        return sort_pending_requirements_for_investigation(
-            pending,
-            active_focus=getattr(self, "_active_focus", None),
-            session=self,
-        )
+        return graph.pending_requirements()
 
     def build_structural_context(self, analyses: list[object]) -> str:
         sections = [
@@ -876,7 +816,6 @@ class OrchestratorSession:
             "Análise vertical: quando o usuário quer entender uma tabela em profundidade\n"
             "Análise horizontal: quando o usuário menciona relações entre tabelas ou objetivos que requerem cruzamento\n"
         )
-        pending_reqs = self.pending_requirements() if hasattr(self, 'knowledge_graph') else []
         prompt = build_interface_prompt(
             source_path=self.source_path,
             source_type=self.source_type,
@@ -885,30 +824,9 @@ class OrchestratorSession:
             result_context=result_context,
             structural_context=self._full_structural_context if is_first_call else self.curated_context_for(user_text, is_first_call=is_first_call),
             is_first_call=is_first_call,
-            pending_requirements=pending_reqs,
         )
         response = self.interface_ai.send(prompt, system_prompt=system_prompt)
-        self._last_presented_options = self._extract_structured_options(response.content)
         return response.content
-
-    def _extract_structured_options(self, reply_text: str) -> list[dict[str, object]]:
-        options: list[dict[str, object]] = []
-        for line in reply_text.splitlines():
-            match = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
-            if not match:
-                continue
-            try:
-                index = int(match.group(1))
-            except ValueError:
-                continue
-            options.append(
-                {
-                    "index": index,
-                    "text": match.group(2).strip(),
-                    "created_at_turn": len(getattr(self, "history", [])),
-                }
-            )
-        return options
 
     def orchestrate(
         self,
@@ -1048,8 +966,6 @@ class OrchestratorSession:
     def execute_action(self, action_payload: dict[str, object]) -> str:
         action = action_payload["action"]
         requirement_id = str(action_payload.get("__requirement_id", "")).strip()
-        source_requirement_id = str(action_payload.get("_source_requirement_id", "")).strip()
-        source_requirement_info = self._find_requirement_in_graph(source_requirement_id or requirement_id)
         if action == "tables":
             return json.dumps(
                 {
@@ -1084,12 +1000,8 @@ class OrchestratorSession:
             self.update_knowledge_graph(payload, action="analyze_unit")
             summary_line = summarize_tabular_analysis(analysis).splitlines()[0][:120] if analysis else unit_name
             self._log_execution({"action": "analyze_unit", "unit": unit_name, "summary": summary_line})
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "analyze_vertical":
             unit_name = str(action_payload["unit_name"])
@@ -1107,12 +1019,8 @@ class OrchestratorSession:
             )
             self.update_knowledge_graph(payload, action="analyze_vertical")
             self._log_execution({"action": "analyze_vertical", "unit": unit_name, "depth": depth, "cache_key": cache_key})
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "analyze_horizontal":
             unit_a = str(action_payload["unit_a"])
@@ -1120,53 +1028,26 @@ class OrchestratorSession:
             payload = self.analyze_horizontal(unit_a, unit_b)
             self.update_knowledge_graph(payload, action="analyze_horizontal")
             self._log_execution({"action": "analyze_horizontal", "unit_a": unit_a, "unit_b": unit_b, "cache_key": str(payload.get("cache_key", ""))})
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "recall":
             key = str(action_payload["key"])
             payload = self.recall_core_cache(key)
             self._log_execution({"action": "recall", "cache_key": key})
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "schema":
             table = str(action_payload["table"])
-            result = self._schema_for_table(table)
-            self._finalize_requirement_execution(
-                result=result,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
-            return json.dumps(result, ensure_ascii=False, indent=2)
+            return json.dumps(self._schema_for_table(table), ensure_ascii=False, indent=2)
         if action == "query":
             query_id = str(action_payload["query_id"])
             payload = self._run_catalog_query(query_id)
             self.update_knowledge_graph(payload, action="query")
             self._log_execution({"action": "query", "query_id": query_id, "sql": str(payload.get("sql", ""))[:200], "cache_key": str(payload.get("cache_key", ""))})
-            try:
-                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
-                self._create_categorical_children(last_node, payload, source_requirement_id or None)
-                textual_requirements = self._build_requirements_from_textual_clues(result=payload, source_node_id=last_node.id)
-                related_requirements = self._build_related_entity_requirements(result=payload, source_node_id=last_node.id)
-                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
-            except Exception:
-                pass
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "template":
             template_id = str(action_payload["template_id"])
@@ -1177,20 +1058,8 @@ class OrchestratorSession:
             payload = self._validate_and_preview_sql(sql) | {"template_id": template_id, "sql": sql}
             self.update_knowledge_graph(payload, action="template")
             self._log_execution({"action": "template", "template_id": template_id, "sql": sql[:200]})
-            try:
-                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
-                self._create_categorical_children(last_node, payload, source_requirement_id or None)
-                textual_requirements = self._build_requirements_from_textual_clues(result=payload, source_node_id=last_node.id)
-                related_requirements = self._build_related_entity_requirements(result=payload, source_node_id=last_node.id)
-                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
-            except Exception:
-                pass
-            self._finalize_requirement_execution(
-                result=payload,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "request_new_query":
             description = str(action_payload["description"])
@@ -1198,146 +1067,12 @@ class OrchestratorSession:
             result = self._register_session_query(description=description, suggested_sql=suggested_sql)
             self.update_knowledge_graph(result, action="query")
             self._log_execution({"action": "request_new_query", "description": description[:100], "sql": suggested_sql[:200], "cache_key": str(result.get("cache_key", ""))})
-            try:
-                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
-                self._create_categorical_children(last_node, result, source_requirement_id or None)
-                textual_requirements = self._build_requirements_from_textual_clues(result=result, source_node_id=last_node.id)
-                related_requirements = self._build_related_entity_requirements(result=result, source_node_id=last_node.id)
-                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
-            except Exception:
-                pass
-            self._finalize_requirement_execution(
-                result=result,
-                source_requirement_id=source_requirement_id,
-                requirement_id=requirement_id,
-                source_requirement_info=source_requirement_info,
-            )
+            if requirement_id:
+                self.knowledge_graph.mark_requirement_resolved(requirement_id)
             return json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if action == "done":
             return str(action_payload["conclusion"])
         raise ValueError(f"Ação não suportada: {action}")
-
-    def _finalize_requirement_execution(
-        self,
-        *,
-        result: dict[str, object],
-        source_requirement_id: str,
-        requirement_id: str,
-        source_requirement_info: tuple[KnowledgeNode, dict[str, object]] | None,
-    ) -> None:
-        target_requirement_id = source_requirement_id or requirement_id
-        if not target_requirement_id and str(result.get("sql", "")).strip():
-            self._resolve_matching_requirement_for_result(result)
-            matched_requirement_id = str(result.get("_matched_requirement_id", "")).strip()
-            if matched_requirement_id:
-                target_requirement_id = matched_requirement_id
-                source_requirement_info = self._find_requirement_in_graph(matched_requirement_id)
-        if target_requirement_id:
-            self.knowledge_graph.mark_requirement_resolved(target_requirement_id)
-        if source_requirement_info is not None:
-            requirement = source_requirement_info[1]
-            if str(requirement.get("role", "")).strip().lower() == "textual_clue":
-                clue_group_id = str(requirement.get("source_node_id", "")).strip()
-                if clue_group_id:
-                    active_focus = getattr(self, "_active_focus", None)
-                    if isinstance(active_focus, dict):
-                        active_focus["clue_group_id"] = clue_group_id
-        if source_requirement_info is not None and self._is_category_filter_requirement(source_requirement_info[1]):
-            last_node = getattr(self.knowledge_graph, "nodes", [])[-1] if getattr(self.knowledge_graph, "nodes", []) else None
-            if last_node is not None:
-                drilldowns = self._build_drilldown_requirements_from_filtered_result(
-                    result=result,
-                    source_requirement=source_requirement_info[1],
-                    source_node_id=last_node.id,
-                )
-                for requirement in drilldowns:
-                    if not self._requirement_exists(str(requirement.get("id", ""))):
-                        last_node.next_requirements.append(requirement)
-                self._active_focus = {
-                    "source_requirement_id": target_requirement_id,
-                    "cache_key": result.get("cache_key", ""),
-                    "units": result.get("units", []),
-                    "columns": result.get("columns", []),
-                    "filter": source_requirement_info[1].get("filter", {}),
-                    "node_id": last_node.id,
-                }
-
-    def _normalize_sql_for_requirement_match(self, sql: str) -> str:
-        normalized = " ".join(sql.strip().lower().split())
-        normalized = re.sub(r"\s*,\s*", ", ", normalized)
-        return normalized
-
-    def _filter_for_requirement(self, requirement: dict[str, object]) -> dict[str, object] | None:
-        filter_payload = requirement.get("filter")
-        if isinstance(filter_payload, dict) and str(filter_payload.get("column", "")).strip():
-            return filter_payload
-        parent_requirement_id = str(requirement.get("parent_requirement_id", "")).strip()
-        parent_requirement_info = self._find_requirement_in_graph(parent_requirement_id)
-        if parent_requirement_info is not None:
-            parent_filter = parent_requirement_info[1].get("filter")
-            if isinstance(parent_filter, dict) and str(parent_filter.get("column", "")).strip():
-                return parent_filter
-        active_focus = getattr(self, "_active_focus", None)
-        if isinstance(active_focus, dict):
-            focus_filter = active_focus.get("filter")
-            if isinstance(focus_filter, dict) and str(focus_filter.get("column", "")).strip():
-                return focus_filter
-        return None
-
-    def _requirement_matches_result(self, requirement: dict[str, object], result: dict[str, object]) -> bool:
-        suggested = requirement.get("suggested_action")
-        if not isinstance(suggested, dict):
-            return False
-        suggested_sql = str(suggested.get("suggested_sql", "")).strip()
-        result_sql = str(result.get("sql", "")).strip()
-        if not suggested_sql or not result_sql:
-            return False
-        if self._normalize_sql_for_requirement_match(suggested_sql) == self._normalize_sql_for_requirement_match(result_sql):
-            return True
-        if str(requirement.get("role", "")).strip().lower() != "drilldown":
-            return False
-        requirement_units = requirement.get("units")
-        result_units = result.get("units")
-        req_unit = str(requirement_units[0]).strip() if isinstance(requirement_units, list) and requirement_units else ""
-        result_unit = str(result_units[0]).strip() if isinstance(result_units, list) and result_units else ""
-        if req_unit and result_unit and req_unit != result_unit:
-            return False
-        filter_payload = self._filter_for_requirement(requirement)
-        if not isinstance(filter_payload, dict):
-            return False
-        filter_column = str(filter_payload.get("column", "")).strip()
-        filter_value = self._quote_sql_literal(filter_payload.get("value"))
-        if not filter_column:
-            return False
-        normalized_result_sql = self._normalize_sql_for_requirement_match(result_sql)
-        expected_filter_clause = self._normalize_sql_for_requirement_match(f"{filter_column} = {filter_value}")
-        if expected_filter_clause not in normalized_result_sql:
-            return False
-        normalized_suggested_sql = self._normalize_sql_for_requirement_match(suggested_sql)
-        for token in (
-            " is not null",
-            "trim(cast(",
-            "group by",
-            "substr(cast(",
-        ):
-            if token in normalized_suggested_sql and token in normalized_result_sql:
-                return True
-        return False
-
-    def _resolve_matching_requirement_for_result(self, result: dict[str, object]) -> bool:
-        graph = getattr(self, "knowledge_graph", None)
-        if graph is None:
-            return False
-        for requirement in graph.pending_requirements():
-            if not self._requirement_matches_result(requirement, result):
-                continue
-            requirement_id = str(requirement.get("id", "")).strip()
-            if not requirement_id:
-                continue
-            if self.knowledge_graph.mark_requirement_resolved(requirement_id):
-                result["_matched_requirement_id"] = requirement_id
-                return True
-        return False
 
     def update_knowledge_graph(self, result: dict[str, object], *, action: str) -> None:
         graph = getattr(self, "knowledge_graph", None)
@@ -1444,8 +1179,6 @@ class OrchestratorSession:
         ordered_requirements = sort_pending_requirements_for_investigation(
             list(node.next_requirements),
             active_focus=getattr(self, "_active_focus", None),
-            session=self,
-            graph=graph,
         )
         visible_requirement_ids: set[str] = set()
         for requirement in ordered_requirements:
@@ -1631,14 +1364,6 @@ class OrchestratorSession:
             raise ValueError(f"Unidade não encontrada: {unit_name}")
         return unit
 
-    def _find_requirement_in_graph(self, requirement_id: str) -> tuple[KnowledgeNode, dict[str, object]] | None:
-        if not requirement_id:
-            return None
-        graph = getattr(self, "knowledge_graph", None)
-        if graph is None or not hasattr(graph, "find_requirement"):
-            return None
-        return graph.find_requirement(requirement_id)
-
     def _requirement_exists(self, requirement_id: str) -> bool:
         normalized_id = requirement_id.strip()
         if not normalized_id:
@@ -1761,39 +1486,6 @@ class OrchestratorSession:
                 compatible.append(unit.unit_name)
         return compatible
 
-    def _is_category_filter_requirement(self, requirement: dict[str, object]) -> bool:
-        if str(requirement.get("role", "")).strip() == "category_filter":
-            return True
-        filter_payload = requirement.get("filter")
-        return isinstance(filter_payload, dict) and bool(str(filter_payload.get("column", "")).strip())
-
-    def _build_select_columns_for_filtered_query(self, table: str, filter_column: str) -> str:
-        try:
-            structure = self._find_unit(table).get_structure()
-            classified = classify_columns_from_structure(structure)
-            columns = classified["columns"]
-            prioritized: list[str] = []
-            for group_name in (
-                "candidate_key_columns",
-                "datetime_like_columns",
-                "categorical_columns",
-                "text_columns",
-            ):
-                for column in classified.get(group_name, []):
-                    if column not in prioritized:
-                        prioritized.append(column)
-            for column in columns:
-                if column not in prioritized:
-                    prioritized.append(column)
-            selected = [column for column in prioritized if column != filter_column][:8]
-            if filter_column not in selected and len(selected) < 8:
-                selected.append(filter_column)
-            if not selected:
-                return "*"
-            return ", ".join(selected[:8])
-        except Exception:
-            return "*"
-
     def _build_horizontal_requirements(self, payload: dict[str, object]) -> list[dict[str, object]]:
         units = list(payload.get("units", []))
         join_keys = list(payload.get("join_keys", []))
@@ -1837,19 +1529,9 @@ class OrchestratorSession:
         if not isinstance(requirements, list):
             return []
         sanitized: list[dict[str, object]] = []
-        seen_ids: set[str] = set()
         for item in requirements:
-            if not isinstance(item, dict):
-                continue
-            requirement = {str(key): self._serialize_for_cache(value) for key, value in item.items()}
-            requirement_id = str(requirement.get("id", "")).strip()
-            if requirement_id:
-                if requirement_id in seen_ids:
-                    continue
-                if self._requirement_exists(requirement_id):
-                    continue
-                seen_ids.add(requirement_id)
-            sanitized.append(requirement)
+            if isinstance(item, dict):
+                sanitized.append({str(key): self._serialize_for_cache(value) for key, value in item.items()})
         return sanitized
 
     def _schema_for_table(self, table_name: str) -> dict[str, object]:
@@ -1963,264 +1645,6 @@ class OrchestratorSession:
             "row_count_preview": len(rows),
             "truncated": len(rows) == 200,
         }
-
-    def _quote_sql_literal(self, value: object) -> str:
-        if value is None:
-            return "NULL"
-        if isinstance(value, (int, float)):
-            return str(value)
-        s = str(value)
-        s = s.replace("'", "''")
-        return f"'{s}'"
-
-    def _detect_categorical_distribution(self, payload: dict[str, object]) -> dict | None:
-        rows = payload.get("rows") or []
-        if not rows:
-            return None
-        columns = payload.get("columns") or []
-        if not columns or len(columns) < 2:
-            return None
-        sql_text = str(payload.get("sql", "") or "")
-        sql_upper = sql_text.upper()
-        count_names = {"total", "count", "qtd", "quantidade", "n", "cnt"}
-        count_idx = None
-        for idx, col in enumerate(columns):
-            if str(col).strip().lower() in count_names:
-                count_idx = idx
-                break
-        cat_idx = None
-        for idx, col in enumerate(columns):
-            if idx == count_idx:
-                continue
-            cat_idx = idx
-            break
-        # try infer count column by sample numeric values
-        if count_idx is None:
-            for idx in range(len(columns)):
-                if idx == 0:
-                    continue
-                try:
-                    sample = rows[0][idx]
-                except Exception:
-                    continue
-                if isinstance(sample, (int, float)):
-                    count_idx = idx
-                    cat_idx = 0 if cat_idx is None else cat_idx
-                    break
-        if cat_idx is None or count_idx is None:
-            return None
-        # require GROUP BY or numeric counts in sample
-        if "GROUP BY" not in sql_upper:
-            numeric_sample = False
-            for r in rows[:5]:
-                try:
-                    if isinstance(r[count_idx], (int, float)):
-                        numeric_sample = True
-                        break
-                except Exception:
-                    continue
-            if not numeric_sample:
-                return None
-        units = payload.get("units") or []
-        table = units[0] if isinstance(units, list) and units else None
-        if not table:
-            m = re.search(r"\bFROM\s+([A-Za-z0-9_\".]+)", str(payload.get("sql", "")), flags=re.IGNORECASE)
-            if m:
-                table = m.group(1).strip('"')
-        return {"category_col": columns[cat_idx], "count_col": columns[count_idx], "table": table, "rows": rows}
-
-    def _create_categorical_children(self, node: "KnowledgeNode", payload: dict[str, object], source_requirement_id: str | None) -> None:
-        info = self._detect_categorical_distribution(payload)
-        if not info:
-            return
-        columns = payload.get("columns") or []
-        rows = info.get("rows") or []
-        try:
-            count_idx = columns.index(info["count_col"])
-        except Exception:
-            count_idx = 1 if len(columns) > 1 else 0
-        try:
-            cat_idx = columns.index(info["category_col"])
-        except Exception:
-            cat_idx = 0
-        # sort rows by count descending when possible
-        def _row_count_val(r):
-            try:
-                v = r[count_idx]
-                return float(v) if isinstance(v, (int, float)) else float(str(v).replace(',', ''))
-            except Exception:
-                return 0.0
-        sorted_rows = sorted(rows, key=_row_count_val, reverse=True)
-        top_n = min(5, len(sorted_rows))
-        category = info["category_col"]
-        count_col = info["count_col"]
-        table = info.get("table") or (payload.get("units") or [None])[0] or "unknown"
-        relevant_columns_list = [c for c in columns if c != count_col][:5]
-        relevant_columns = ", ".join(relevant_columns_list) if relevant_columns_list else "*"
-        for row in sorted_rows[:top_n]:
-            value = row[cat_idx]
-            safe = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")[:40] or "v"
-            req_id = f"req_{table}_{category}_{safe}"
-            if self._requirement_exists(req_id):
-                continue
-            quoted = self._quote_sql_literal(value)
-            selected_columns = self._build_select_columns_for_filtered_query(str(table), str(category))
-            suggested_sql = f"SELECT {selected_columns} FROM {table} WHERE {category} = {quoted} LIMIT 50"
-            new_req = {
-                "id": req_id,
-                "kind": "query",
-                "units": [table],
-                "description": f"Explorar registros onde {category} = {value}",
-                "reason": f"A distribuição por {category} mostrou esse valor entre os principais.",
-                "role": "category_filter",
-                "parent_requirement_id": source_requirement_id or "",
-                "filter": {
-                    "column": category,
-                    "value": value,
-                    "operator": "=",
-                },
-                "suggested_action": {
-                    "action": "request_new_query",
-                    "description": f"explorar registros filtrados por {category}",
-                    "suggested_sql": suggested_sql,
-                },
-                "status": "pending",
-                "source_node_id": node.id,
-            }
-            node.next_requirements.append(new_req)
-
-    def _build_drilldown_requirements_from_filtered_result(
-        self,
-        *,
-        result: dict[str, object],
-        source_requirement: dict[str, object] | None,
-        source_node_id: str,
-    ) -> list[dict[str, object]]:
-        if not source_requirement:
-            return []
-        units = result.get("units", [])
-        if not isinstance(units, list) or not units:
-            return []
-        table = str(units[0]).strip()
-        if not table:
-            return []
-        filter_payload = source_requirement.get("filter", {})
-        if not isinstance(filter_payload, dict):
-            return []
-        filter_column = str(filter_payload.get("column", "")).strip()
-        if not filter_column:
-            return []
-        source_requirement_id = str(source_requirement.get("id", "")).strip()
-        filter_sql = f"{filter_column} = {self._quote_sql_literal(filter_payload.get('value'))}"
-        requirements: list[dict[str, object]] = []
-        try:
-            structure = self._find_unit(table).get_structure()
-            classified = classify_columns_from_structure(structure)
-        except Exception:
-            classified = {
-                "columns": [str(item) for item in result.get("columns", []) if isinstance(item, str)],
-                "candidate_key_columns": detect_candidate_key_columns(list(result.get("columns", []))),
-                "categorical_columns": [column for column in detect_categorical_columns(list(result.get("columns", []))) if column != filter_column],
-                "numeric_columns": detect_numeric_columns(list(result.get("columns", []))),
-                "text_columns": [column for column in detect_text_columns(list(result.get("columns", []))) if column != filter_column],
-                "datetime_like_columns": detect_datetime_like_columns(list(result.get("columns", []))),
-            }
-
-        def append_requirement(requirement: dict[str, object]) -> None:
-            requirement["role"] = "drilldown"
-            requirement["parent_requirement_id"] = source_requirement_id
-            requirement["source_node_id"] = source_node_id
-            requirement["status"] = "pending"
-            if not self._requirement_exists(str(requirement.get("id", ""))):
-                requirements.append(requirement)
-
-        text_columns = [column for column in classified.get("text_columns", []) if column != filter_column]
-        if text_columns:
-            sample_columns = list(dict.fromkeys((classified.get("candidate_key_columns", []) + text_columns)[:4]))
-            select_clause = ", ".join(sample_columns) if sample_columns else "*"
-            text_column = text_columns[0]
-            append_requirement(
-                {
-                    "id": f"req_{table}_{filter_column}_text_{re.sub(r'[^a-z0-9]+', '_', text_column.lower()).strip('_') or 'text'}",
-                    "kind": "query",
-                    "units": [table],
-                    "description": f"Amostrar textos em {table} dentro do filtro atual",
-                    "reason": "colunas textuais disponíveis no resultado filtrado",
-                    "suggested_action": {
-                        "action": "request_new_query",
-                        "description": f"amostrar textos filtrados por {filter_column}",
-                        "suggested_sql": (
-                            f"SELECT {select_clause} FROM {table} "
-                            f"WHERE {filter_sql} AND {text_column} IS NOT NULL "
-                            f"AND TRIM(CAST({text_column} AS TEXT)) <> '' LIMIT 50"
-                        ),
-                    },
-                }
-            )
-
-        other_categorical = [column for column in classified.get("categorical_columns", []) if column != filter_column]
-        if other_categorical:
-            category_column = other_categorical[0]
-            append_requirement(
-                {
-                    "id": f"req_{table}_{filter_column}_group_{re.sub(r'[^a-z0-9]+', '_', category_column.lower()).strip('_') or 'group'}",
-                    "kind": "query",
-                    "units": [table],
-                    "description": f"Agrupar o recorte atual por {category_column}",
-                    "reason": "há outras colunas categóricas para aprofundar dentro do filtro",
-                    "suggested_action": {
-                        "action": "request_new_query",
-                        "description": f"agrupar dentro do filtro por {category_column}",
-                        "suggested_sql": (
-                            f"SELECT {category_column}, COUNT(*) AS total FROM {table} "
-                            f"WHERE {filter_sql} AND {category_column} IS NOT NULL "
-                            f"AND TRIM(CAST({category_column} AS TEXT)) <> '' "
-                            f"GROUP BY {category_column} ORDER BY total DESC LIMIT 50"
-                        ),
-                    },
-                }
-            )
-
-        datetime_columns = classified.get("datetime_like_columns", [])
-        if datetime_columns:
-            datetime_column = datetime_columns[0]
-            append_requirement(
-                {
-                    "id": f"req_{table}_{filter_column}_time_{re.sub(r'[^a-z0-9]+', '_', datetime_column.lower()).strip('_') or 'time'}",
-                    "kind": "query",
-                    "units": [table],
-                    "description": f"Agrupar o recorte atual por período em {datetime_column}",
-                    "reason": "há coluna temporal no resultado filtrado",
-                    "suggested_action": {
-                        "action": "request_new_query",
-                        "description": f"agrupar dentro do filtro por período",
-                        "suggested_sql": (
-                            f"SELECT substr(CAST({datetime_column} AS TEXT), 1, 10) AS period, COUNT(*) AS total "
-                            f"FROM {table} WHERE {filter_sql} AND {datetime_column} IS NOT NULL "
-                            f"GROUP BY period ORDER BY period LIMIT 50"
-                        ),
-                    },
-                }
-            )
-
-        compatible_units = self._find_compatible_units(table, classified.get("candidate_key_columns", []) or classified.get("columns", []))
-        if compatible_units:
-            append_requirement(
-                {
-                    "id": f"req_{table}_cross_{re.sub(r'[^a-z0-9]+', '_', compatible_units[0].lower()).strip('_') or 'unit'}",
-                    "kind": "analyze_horizontal",
-                    "units": [table, compatible_units[0]],
-                    "description": f"Cruzar o recorte atual com {compatible_units[0]}",
-                    "reason": "há outra unidade com colunas compatíveis por chave",
-                    "suggested_action": {
-                        "action": "analyze_horizontal",
-                        "unit_a": table,
-                        "unit_b": compatible_units[0],
-                    },
-                }
-            )
-
-        return requirements
 
     def _person_like_units(self) -> list[tuple[str, dict[str, str]]]:
         matches: list[tuple[str, dict[str, str]]] = []
@@ -2596,52 +2020,6 @@ def build_interface_prompt(
     is_first_call: bool,
     pending_requirements: list[dict[str, object]] | None = None,
 ) -> str:
-    def _has_structural_analysis_context() -> bool:
-        context_text = " ".join(
-            part for part in (result_context or "", structural_context or "") if isinstance(part, str)
-        )
-        markers = (
-            "row_count",
-            "columns",
-            "evidence",
-            "operational_summary",
-            "next_requirements",
-            "pending_requirements",
-            "candidate_key_columns",
-            "categorical_columns",
-            "numeric_columns",
-            "text_columns",
-        )
-        return any(marker in context_text for marker in markers)
-
-    def _format_pending_requirement(requirement: dict[str, object]) -> dict[str, object]:
-        suggested_action = requirement.get("suggested_action")
-        suggested_summary = {}
-        if isinstance(suggested_action, dict):
-            suggested_summary = {
-                "action": str(suggested_action.get("action", "")).strip(),
-                "description": str(suggested_action.get("description", "")).strip(),
-            }
-        return {
-            "id": str(requirement.get("id", "")).strip(),
-            "kind": str(requirement.get("kind", "")).strip(),
-            "role": str(requirement.get("role", "")).strip(),
-            "units": [str(unit) for unit in requirement.get("units", [])] if isinstance(requirement.get("units", []), list) else [],
-            "description": str(requirement.get("description", "")).strip(),
-            "suggested_action": suggested_summary,
-        }
-
-    ordered_pending = pending_requirements or []
-    non_schema_pending = [
-        requirement for requirement in ordered_pending
-        if str(requirement.get("kind", "")).strip().lower() != "schema"
-    ]
-    schema_pending = [
-        requirement for requirement in ordered_pending
-        if str(requirement.get("kind", "")).strip().lower() == "schema"
-    ]
-    readable_pending = [_format_pending_requirement(req) for req in [*non_schema_pending, *schema_pending]]
-
     payload = {
         "source_path": source_path,
         "source_type": source_type,
@@ -2651,16 +2029,7 @@ def build_interface_prompt(
         "structural_context": structural_context,
         "user_message": user_text,
         "available_result": result_context,
-        "pending_requirements": readable_pending,
-        "interface_rules": {
-            "avoid_redundant_schema_after_analysis": _has_structural_analysis_context(),
-            "instruction": (
-                "Se já houver contexto estrutural suficiente e pending_requirements úteis, "
-                "NÃO sugira schema/estrutura/colunas como próximo passo principal; "
-                "priorize o primeiro pending_requirement operacional não-schema. "
-                "Só mencione schema se o usuário pedir explicitamente ou se for o único caminho útil."
-            ),
-        },
+        "pending_requirements": pending_requirements or [],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -3094,23 +2463,18 @@ def build_operational_summary_for_query(
     }
     if query_id:
         payload["query_id"] = query_id
-        # Only offer a recall requirement when the preview was truncated; otherwise
-        # prefer generating exploratory next requirements (e.g., categorical children).
-        if truncated:
-            payload["next_requirements"] = [
-                {
-                    "id": f"req_recall_query_{query_id}",
-                    "kind": "recall",
-                    "units": units,
-                    "description": f"Recuperar detalhes da consulta {query_id}",
-                    "reason": "resultado já calculado e cacheado",
-                    "suggested_action": {"action": "recall", "key": cache_key},
-                    "status": "pending",
-                    "source_node_id": "",
-                }
-            ]
-        else:
-            payload["next_requirements"] = []
+        payload["next_requirements"] = [
+            {
+                "id": f"req_recall_query_{query_id}",
+                "kind": "recall",
+                "units": units,
+                "description": f"Recuperar detalhes da consulta {query_id}",
+                "reason": "resultado já calculado e cacheado",
+                "suggested_action": {"action": "recall", "key": cache_key},
+                "status": "pending",
+                "source_node_id": "",
+            }
+        ]
     return payload
 
 
