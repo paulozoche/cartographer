@@ -33,7 +33,7 @@ git clone https://github.com/paulozoche/cartographer.git
 cd cartographer
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m src.agnostic.interfaces.api
+make server
 ```
 
 ---

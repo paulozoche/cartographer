@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -12,6 +13,11 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from agnostic.ai.ports.ai_orchestrator import AIResponse
+from agnostic.application.planning.rule_based_planner import (
+    extract_units_from_sql,
+    plan_deterministic_action,
+    sort_pending_requirements_for_investigation,
+)
 from agnostic.config import load_app_config
 from agnostic.domain.analysis.analyze_tabular_unit import analyze_tabular_unit
 from agnostic.infrastructure.db.sqlite_source import SQLiteDataSource
@@ -81,6 +87,7 @@ MAX_ATTEMPTS_PER_TURN = 3
 INTERFACE_MODEL = "deepseek-chat"
 ORCHESTRATOR_MODEL = "deepseek-chat"
 CURATOR_MODEL = "deepseek-chat"
+logger = logging.getLogger(__name__)
 
 
 class DeepSeekAPIError(RuntimeError):
@@ -94,6 +101,14 @@ class KnowledgeNode:
     unit: str
     data: dict
     timestamp: str
+    action: str = ""
+    cache_key: str = ""
+    units: list[str] = field(default_factory=list)
+    columns: list[str] = field(default_factory=list)
+    join_keys: list[str] = field(default_factory=list)
+    sample_entities: list[str] = field(default_factory=list)
+    next_requirements: list[dict[str, object]] = field(default_factory=list)
+    status: str = ""
 
 
 @dataclass
@@ -114,14 +129,86 @@ class KnowledgeGraph:
             lines.append("- Nenhum nó registrado.")
         else:
             for node in self.nodes:
-                lines.append(f"- {node.id} [{node.unit}]: {node.label}")
+                cache_key = f" cache={node.cache_key}" if node.cache_key else ""
+                units = f" units={', '.join(node.units)}" if node.units else ""
+                columns = f" columns={', '.join(node.columns[:6])}" if node.columns else ""
+                joins = f" join_keys={', '.join(node.join_keys[:4])}" if node.join_keys else ""
+                candidate_keys = ", ".join(node.data.get("evidence", {}).get("candidate_key_columns", [])[:4]) if isinstance(node.data, dict) else ""
+                key_text = f" candidate_keys={candidate_keys}" if candidate_keys else ""
+                sample_entities = ", ".join(node.sample_entities[:4]) if node.sample_entities else ""
+                sample_text = f" sample_entities={sample_entities}" if sample_entities else ""
+                lines.append(
+                    f"- {node.id} [{node.unit}] action={node.action or 'unknown'} status={node.status or ''}:{cache_key}{units}{columns}{joins}{key_text}{sample_text} :: {node.label}"
+                )
         lines.extend(["", "### Arestas"])
         if not self.edges:
             lines.append("- Nenhuma aresta registrada.")
         else:
             for edge in self.edges:
                 lines.append(f"- {edge.from_id} -> {edge.relation} -> {edge.to_id}")
+        # Resolved requirements
+        lines.extend(["", "### Requisitos Resolvidos"])
+        resolved: list[dict[str, object]] = []
+        for node in self.nodes:
+            for requirement in node.next_requirements:
+                if str(requirement.get("status", "")).strip() == "resolved":
+                    resolved.append(requirement)
+        if not resolved:
+            lines.append("- Nenhum requisito resolvido.")
+        else:
+            for requirement in resolved:
+                units = ", ".join(str(unit) for unit in requirement.get("units", []))
+                lines.append(f"- {requirement.get('id', '')} [{requirement.get('kind', '')}] units={units}: {requirement.get('description', '')}")
+
+        lines.extend(["", "### Requisitos Pendentes"])
+        pending = self.pending_requirements()
+        if not pending:
+            lines.append("- Nenhum requisito pendente.")
+        else:
+            for requirement in pending:
+                units = ", ".join(str(unit) for unit in requirement.get("units", []))
+                lines.append(
+                    f"- {requirement.get('id', '')} [{requirement.get('kind', '')}] status={requirement.get('status', '')} units={units}: {requirement.get('description', '')}"
+                )
         return "\n".join(lines)
+
+    def pending_requirements(self, *, active_focus: dict[str, object] | None = None) -> list[dict[str, object]]:
+        pending: list[dict[str, object]] = []
+        resolved_ids = {
+            str(requirement.get("id", "")).strip()
+            for node in self.nodes
+            for requirement in node.next_requirements
+            if str(requirement.get("status", "")).strip() == "resolved" and str(requirement.get("id", "")).strip()
+        }
+        seen_ids: set[str] = set()
+        # iterate nodes in reverse to prioritize recent nodes first
+        for node in reversed(self.nodes):
+            for requirement in node.next_requirements:
+                requirement_id = str(requirement.get("id", "")).strip()
+                if requirement_id and requirement_id in resolved_ids:
+                    continue
+                if requirement_id and requirement_id in seen_ids:
+                    continue
+                if requirement_id:
+                    seen_ids.add(requirement_id)
+                if str(requirement.get("status", "")).strip() == "pending":
+                    pending.append(requirement)
+        return sort_pending_requirements_for_investigation(pending, active_focus=active_focus, graph=self)
+
+    def mark_requirement_resolved(self, requirement_id: str) -> bool:
+        for node in self.nodes:
+            for requirement in node.next_requirements:
+                if requirement.get("id") == requirement_id:
+                    requirement["status"] = "resolved"
+                    return True
+        return False
+
+    def find_requirement(self, requirement_id: str) -> tuple[KnowledgeNode, dict[str, object]] | None:
+        for node in self.nodes:
+            for requirement in node.next_requirements:
+                if requirement.get("id") == requirement_id:
+                    return node, requirement
+        return None
 
 
 class DeepSeekClient:
@@ -218,6 +305,9 @@ class OrchestratorSession:
         self._curator_cache: dict[str, dict[str, object]] = {}
         self._session_query_catalog: dict[str, str] = {}
         self._candidate_queries: list[tuple[str, str]] = []
+        self._execution_log: list[dict[str, str]] = []
+        self._active_focus: dict[str, object] | None = None
+        self._last_presented_options: list[dict[str, object]] = []
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY não encontrada. Verifique o arquivo .env.")
@@ -304,7 +394,248 @@ class OrchestratorSession:
         self._set_core_cache(cache_key, payload)
         return cache_key
 
-    def analyze_horizontal(self, unit_a: str, unit_b: str) -> str:
+    def _build_next_requirements_for_unit(
+        self,
+        *,
+        unit_name: str,
+        structure: object,
+        analysis: object | None,
+        cache_key: str,
+    ) -> list[dict[str, object]]:
+        classified = classify_columns_from_structure(structure, analysis=analysis)
+        requirements: list[dict[str, object]] = []
+        source_type = getattr(self, "source_type", "")
+        columns = classified["columns"]
+
+        def append_vertical_requirement(requirement_suffix: str, description: str, reason: str, depth: str) -> None:
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_{requirement_suffix}",
+                    "kind": "analyze_vertical",
+                    "units": [unit_name],
+                    "description": description,
+                    "reason": reason,
+                    "suggested_action": {
+                        "action": "analyze_vertical",
+                        "unit_name": unit_name,
+                        "depth": depth,
+                    },
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+
+        if source_type == "sqlite":
+            if classified["categorical_columns"]:
+                column = classified["categorical_columns"][0]
+                requirements.append(
+                    {
+                        "id": f"req_{unit_name}_categorical_{column}",
+                        "kind": "query",
+                        "units": [unit_name],
+                        "description": f"Contagem agregada por {column}",
+                        "reason": "coluna categórica detectada",
+                        "suggested_action": {
+                            "action": "request_new_query",
+                            "description": f"agregar por {column}",
+                            "suggested_sql": (
+                                f"SELECT {column}, COUNT(*) AS total "
+                                f"FROM {unit_name} "
+                                f"WHERE {column} IS NOT NULL AND TRIM(CAST({column} AS TEXT)) <> '' "
+                                f"GROUP BY {column} ORDER BY total DESC LIMIT 50"
+                            ),
+                        },
+                        "status": "pending",
+                        "source_node_id": "",
+                    }
+                )
+            if classified["text_columns"]:
+                column = classified["text_columns"][0]
+                selected = ", ".join(classified["text_columns"][:2])
+                requirements.append(
+                    {
+                        "id": f"req_{unit_name}_text_{column}",
+                        "kind": "query",
+                        "units": [unit_name],
+                        "description": f"Amostrar registros textuais de {unit_name}",
+                        "reason": "colunas textuais detectadas",
+                        "suggested_action": {
+                            "action": "request_new_query",
+                            "description": f"amostrar textos de {unit_name}",
+                            "suggested_sql": (
+                                f"SELECT {selected} FROM {unit_name} "
+                                f"WHERE {column} IS NOT NULL AND TRIM(CAST({column} AS TEXT)) <> '' LIMIT 50"
+                            ),
+                        },
+                        "status": "pending",
+                        "source_node_id": "",
+                    }
+                )
+            if classified["numeric_columns"]:
+                column = classified["numeric_columns"][0]
+                requirements.append(
+                    {
+                        "id": f"req_{unit_name}_numeric_{column}",
+                        "kind": "query",
+                        "units": [unit_name],
+                        "description": f"Resumo numérico básico de {column}",
+                        "reason": "coluna numérica detectada",
+                        "suggested_action": {
+                            "action": "request_new_query",
+                            "description": f"agregação numérica de {column}",
+                            "suggested_sql": (
+                                f"SELECT COUNT(*) AS total, MIN({column}) AS min_value, MAX({column}) AS max_value, AVG({column}) AS avg_value "
+                                f"FROM {unit_name} WHERE {column} IS NOT NULL"
+                            ),
+                        },
+                        "status": "pending",
+                        "source_node_id": "",
+                    }
+                )
+            if classified["datetime_like_columns"]:
+                column = classified["datetime_like_columns"][0]
+                requirements.append(
+                    {
+                        "id": f"req_{unit_name}_datetime_{column}",
+                        "kind": "query",
+                        "units": [unit_name],
+                        "description": f"Contagem por período de {column}",
+                        "reason": "coluna temporal detectada",
+                        "suggested_action": {
+                            "action": "request_new_query",
+                            "description": f"agregar por período em {column}",
+                            "suggested_sql": (
+                                f"SELECT SUBSTR(CAST({column} AS TEXT), 1, 10) AS period, COUNT(*) AS total "
+                                f"FROM {unit_name} WHERE {column} IS NOT NULL "
+                                f"GROUP BY SUBSTR(CAST({column} AS TEXT), 1, 10) ORDER BY total DESC LIMIT 50"
+                            ),
+                        },
+                        "status": "pending",
+                        "source_node_id": "",
+                    }
+                )
+        elif columns:
+            if classified["categorical_columns"]:
+                append_vertical_requirement(
+                    "categorical_summary",
+                    "Aprofundar contagens e distribuições de colunas categóricas/binárias",
+                    "colunas categóricas detectadas e exigem exploração operacional",
+                    "layer2",
+                )
+            if classified["numeric_columns"]:
+                append_vertical_requirement(
+                    "numeric_summary",
+                    "Aprofundar métricas numéricas e distribuições",
+                    "colunas numéricas detectadas e exigem exploração operacional",
+                    "layer2",
+                )
+            if classified["text_columns"]:
+                append_vertical_requirement(
+                    "text_sample",
+                    "Amostrar conteúdo textual e sinais qualitativos",
+                    "colunas textuais detectadas e exigem exploração operacional",
+                    "layer2",
+                )
+            append_vertical_requirement(
+                "missingness_summary",
+                "Verificar nulos, completude, cardinalidade e possíveis chaves",
+                "unidade tabular já analisada e requer exploração operacional complementar",
+                "heuristics",
+            )
+        compatible_units = self._find_compatible_units(unit_name, columns)
+        if compatible_units:
+            partner = compatible_units[0]
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_cross_{partner}",
+                    "kind": "analyze_horizontal",
+                    "units": [unit_name, partner],
+                    "description": f"Analisar relação estrutural entre {unit_name} e {partner}",
+                    "reason": "colunas potencialmente compatíveis entre unidades",
+                    "suggested_action": {"action": "analyze_horizontal", "unit_a": unit_name, "unit_b": partner},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+        if columns and source_type != "sqlite":
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_schema",
+                    "kind": "schema",
+                    "units": [unit_name],
+                    "description": f"Consultar schema de {unit_name}",
+                    "reason": "complementar a exploração operacional com estrutura explícita",
+                    "suggested_action": {"action": "schema", "table": unit_name},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_recall",
+                    "kind": "recall",
+                    "units": [unit_name],
+                    "description": f"Recuperar detalhes operacionais já calculados para {unit_name}",
+                    "reason": "resultado já calculado e salvo no cache",
+                    "suggested_action": {"action": "recall", "key": cache_key},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+        elif not requirements:
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_schema",
+                    "kind": "schema",
+                    "units": [unit_name],
+                    "description": f"Consultar schema de {unit_name}",
+                    "reason": "nenhuma outra heurística aplicável",
+                    "suggested_action": {"action": "schema", "table": unit_name},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+            requirements.append(
+                {
+                    "id": f"req_{unit_name}_recall",
+                    "kind": "recall",
+                    "units": [unit_name],
+                    "description": f"Recuperar detalhes operacionais já calculados para {unit_name}",
+                    "reason": "resultado já calculado e salvo no cache",
+                    "suggested_action": {"action": "recall", "key": cache_key},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            )
+        return requirements
+
+    def _build_operational_payload_for_unit(
+        self,
+        *,
+        unit_name: str,
+        structure: object,
+        analysis: object | None,
+        cache_key: str,
+        action: str,
+        depth: str | None = None,
+    ) -> dict[str, object]:
+        payload = build_operational_summary_for_unit(
+            unit_name=unit_name,
+            structure=structure,
+            analysis=analysis,
+            cache_key=cache_key,
+            action=action,
+            depth=depth,
+        )
+        payload["next_requirements"] = self._build_next_requirements_for_unit(
+            unit_name=unit_name,
+            structure=structure,
+            analysis=analysis,
+            cache_key=cache_key,
+        )
+        return payload
+
+    def analyze_horizontal(self, unit_a: str, unit_b: str) -> dict[str, object]:
         first = self._find_unit(unit_a)
         second = self._find_unit(unit_b)
         structure_a = first.get_structure()
@@ -312,6 +643,7 @@ class OrchestratorSession:
         columns_a = {column.name: column for column in structure_a.columns}
         columns_b = {column.name: column for column in structure_b.columns}
         same_name_columns = sorted(set(columns_a) & set(columns_b))
+        join_keys = self._infer_join_keys(unit_a, structure_a, unit_b, structure_b)
 
         rows_a = list(first.get_rows())[:50]
         rows_b = list(second.get_rows())[:50]
@@ -352,15 +684,41 @@ class OrchestratorSession:
                     )
 
         payload = {
+            "action": "analyze_horizontal",
+            "status": "cached",
+            "cache_key": f"cross:{unit_a}:{unit_b}",
+            "units": [unit_a, unit_b],
             "unit_a": unit_a,
             "unit_b": unit_b,
             "same_name_columns": same_name_columns,
             "compatible_cardinality": compatible_cardinality,
             "matching_value_patterns": matching_value_patterns,
+            "join_keys": join_keys,
+            "sample_entities": extract_sample_entities(
+                sorted(set(columns_a) | set(columns_b)),
+                rows_a[:5] + rows_b[:5],
+                max_entities=10,
+            ),
+            "operational_summary": {
+                "row_count": None,
+                "columns": sorted(set(columns_a) | set(columns_b)),
+                "metrics_available": False,
+                "notes": ["análise horizontal calculada a partir de schema e amostras curtas"],
+            },
+            "evidence": {
+                "columns": sorted(set(columns_a) | set(columns_b)),
+                "row_count": None,
+                "candidate_key_columns": sorted(set(detect_candidate_key_columns(list(columns_a)) + detect_candidate_key_columns(list(columns_b)))),
+                "categorical_columns": [],
+                "numeric_columns": [],
+                "text_columns": [],
+                "datetime_like_columns": [],
+            },
         }
-        cache_key = f"cross:{unit_a}:{unit_b}"
+        payload["next_requirements"] = self._build_horizontal_requirements(payload)
+        cache_key = str(payload["cache_key"])
         self._set_core_cache(cache_key, payload)
-        return cache_key
+        return payload
 
     def recall_core_cache(self, key: str) -> dict[str, object]:
         payload = getattr(self, "_core_cache", {}).get(key)
@@ -375,6 +733,36 @@ class OrchestratorSession:
             "found": True,
             "cached_result": payload,
         }
+
+    def available_cache_keys(self) -> list[str]:
+        return sorted(getattr(self, "_core_cache", {}).keys())
+
+    def pending_requirements(self) -> list[dict[str, object]]:
+        graph = getattr(self, "knowledge_graph", KnowledgeGraph())
+        pending: list[dict[str, object]] = []
+        resolved_ids = {
+            str(requirement.get("id", "")).strip()
+            for node in getattr(graph, "nodes", [])
+            for requirement in getattr(node, "next_requirements", [])
+            if str(requirement.get("status", "")).strip() == "resolved" and str(requirement.get("id", "")).strip()
+        }
+        seen_ids: set[str] = set()
+        for node in reversed(getattr(graph, "nodes", [])):
+            for requirement in getattr(node, "next_requirements", []):
+                requirement_id = str(requirement.get("id", "")).strip()
+                if requirement_id and requirement_id in resolved_ids:
+                    continue
+                if requirement_id and requirement_id in seen_ids:
+                    continue
+                if requirement_id:
+                    seen_ids.add(requirement_id)
+                if str(requirement.get("status", "")).strip() == "pending":
+                    pending.append(requirement)
+        return sort_pending_requirements_for_investigation(
+            pending,
+            active_focus=getattr(self, "_active_focus", None),
+            session=self,
+        )
 
     def build_structural_context(self, analyses: list[object]) -> str:
         sections = [
@@ -454,7 +842,15 @@ class OrchestratorSession:
             "Você nunca inventa análise e nunca emite JSON.\n"
             "Você nunca calcula percentuais, nunca infere números e nunca produz valores que não vieram diretamente do core ou do banco.\n"
             "Você nunca promete executar algo e nunca usa frases como 'vou executar agora', 'vou investigar' ou 'precisamos executar'.\n"
+            "PROIBIDO: nunca gere blocos de código SQL na resposta.\n"
+            "Se a próxima ação requer uma consulta SQL, descreva o que precisa em português.\n"
+            "A Orquestradora é quem decide e executa o SQL — nunca a Interface.\n"
             "Se um resultado não estiver disponível no contexto, diga apenas 'não tenho esse dado, aguarde a execução'.\n"
+            "Se o resultado contiver operational_summary, evidence ou next_requirements, explique esse contexto operacional e NÃO diga que o dado está indisponível.\n"
+            "Se houver next_requirements ou pending_requirements operacionais, sugira o primeiro passo operacional útil e evite sugerir schema ou estrutura de forma redundante.\n"
+            "Quando o resultado contém pistas concretas (nomes, endereços, IDs),\n"
+            'NÃO termine com "Qual a sua instrução?" ou "Deseja que eu prepare essa busca?".\n'
+            "Informe diretamente o que será executado no próximo passo.\n"
             'Se o resultado contiver "truncated: true", você DEVE avisar o usuário que o resultado está incompleto e NÃO pode concluir sobre padrões, exclusividade ou predominância. Diga apenas: "resultado parcial — não é possível concluir ainda".\n'
             "Para concluir sobre exclusividade, predominância global, ausência ou padrão regional, a query usada deve ser uma query agregada completa.\n"
             "Nunca concluir sobre esses temas a partir de consulta por entidade individual com resultado truncado.\n"
@@ -480,6 +876,7 @@ class OrchestratorSession:
             "Análise vertical: quando o usuário quer entender uma tabela em profundidade\n"
             "Análise horizontal: quando o usuário menciona relações entre tabelas ou objetivos que requerem cruzamento\n"
         )
+        pending_reqs = self.pending_requirements() if hasattr(self, 'knowledge_graph') else []
         prompt = build_interface_prompt(
             source_path=self.source_path,
             source_type=self.source_type,
@@ -488,9 +885,30 @@ class OrchestratorSession:
             result_context=result_context,
             structural_context=self._full_structural_context if is_first_call else self.curated_context_for(user_text, is_first_call=is_first_call),
             is_first_call=is_first_call,
+            pending_requirements=pending_reqs,
         )
         response = self.interface_ai.send(prompt, system_prompt=system_prompt)
+        self._last_presented_options = self._extract_structured_options(response.content)
         return response.content
+
+    def _extract_structured_options(self, reply_text: str) -> list[dict[str, object]]:
+        options: list[dict[str, object]] = []
+        for line in reply_text.splitlines():
+            match = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            try:
+                index = int(match.group(1))
+            except ValueError:
+                continue
+            options.append(
+                {
+                    "index": index,
+                    "text": match.group(2).strip(),
+                    "created_at_turn": len(getattr(self, "history", [])),
+                }
+            )
+        return options
 
     def orchestrate(
         self,
@@ -551,23 +969,36 @@ class OrchestratorSession:
             "Nunca emita done quando o contexto contiver 'erro' ou 'error'.\n"
             "Em caso de erro, tente request_new_query com SQL corrigido.\n\n"
             "LEI 5 — CONFIRMAÇÃO CURTA NÃO ENCERRA E NÃO PARALISA:\n"
+            "Confirmações curtas normalmente já são resolvidas pelo planner determinístico.\n"
+            "Se ainda chegarem aqui, consuma o primeiro pending_requirement aplicável.\n"
             '"sim", "ok", "pode", "prossiga", "continue", "vai", "execute" após uma sugestão da Interface = executar a ação sugerida.\n'
             "Para identificar qual ação executar:\n"
             "1. Ler a última mensagem do histórico da Interface\n"
             "2. Identificar a ação sugerida (query, template, analyze_unit)\n"
             "3. Executar essa ação\n"
             "EXEMPLO LEI 5:\n"
-            'Histórico mostra Interface sugerindo: "Quer que eu explore crime_scene_report?"\n'
+            'Histórico mostra Interface sugerindo: "Quer que eu explore a unidade principal?"\n'
             'Usuário responde: "sim"\n'
-            'Resposta CORRETA: {"action": "analyze_unit", "unit_name": "crime_scene_report"}\n'
+            'Resposta CORRETA: {"action": "analyze_unit", "unit_name": "nome_da_unidade"}\n'
             'Resposta ERRADA: {"action": "tables"}\n'
             'Resposta ERRADA: {"action": "done", "conclusion": "..."}\n'
+            'Se o histórico contém lista numerada de próximos passos e o usuário responde "ok", "sim", "pode", "vai":\n'
+            "- Execute o PRIMEIRO passo da lista\n"
+            "- Não paralise esperando instrução mais específica\n"
             'Nunca responder com "preciso de instrução clara" quando houver uma sugestão pendente no histórico.\n\n'
             "LEI 6 — NÃO REEXECUTE:\n"
-            "Se já existe resultado válido no turno atual, não reexecute o mesmo query_id.\n"
-            "Se o contexto já contém resultado de uma query sobre X, NÃO execute novamente a mesma query sobre X.\n"
-            '"sim", "localize", "consulte", "faça" após um resultado significam AVANÇAR para o próximo passo lógico, não repetir.\n'
-            "Use o resultado existente para decidir o próximo passo.\n"
+            "Não reexecute cálculos já presentes em execution_log ou available_cache_keys.\n"
+            "Se precisar detalhe de resultado anterior, use recall(cache_key).\n"
+            "Se houver pending_requirements, avance para o primeiro requisito não resolvido.\n"
+            "execution_log contém TODAS as ações executadas com sucesso nesta sessão (entre turnos).\n"
+            "Se uma unidade X já aparece em execution_log com action=analyze_unit, NÃO execute analyze_unit sobre X novamente.\n"
+            "Se um SQL sobre tabela X já aparece em execution_log, NÃO execute SQL sobre X novamente com o mesmo filtro.\n"
+            "Se last_result contém pistas (ex: nomes de ruas, testemunhas, IDs), execute a PRÓXIMA ação lógica baseada nessas pistas.\n"
+            "Exemplo: se execution_log mostra analyze_unit de uma unidade e last_result revela entidades ou chaves concretas,\n"
+            "a próxima ação DEVE avançar para a unidade relacionada ou para o requisito pendente correspondente, nunca repetir a análise anterior.\n"
+            "executed_queries contém queries do turno atual — não reexecute dentro do mesmo turno.\n"
+            '"sim", "localize", "consulte", "faça" após um resultado = AVANÇAR para o próximo passo lógico, nunca repetir.\n'
+            "Use execution_log para entender o que já foi feito e decidir o que ainda não foi feito.\n"
             'Quando o usuário quiser aprofundar uma tabela específica, use:\n{"action":"analyze_unit","unit_name":"nome_da_tabela"}\n'
             "Só analise tabelas que o usuário pediu explicitamente.\n"
             "Não analise todas as tabelas de uma vez.\n"
@@ -606,12 +1037,19 @@ class OrchestratorSession:
             executed_queries=executed_queries or [],
             query_catalog=query_catalog or sorted(self.catalog_for_session().keys()),
             attempt_number=attempt_number,
+            execution_log=self._execution_log,
+            knowledge_graph_context=self.knowledge_graph.to_context(),
+            available_cache_keys=self.available_cache_keys(),
+            pending_requirements=self.pending_requirements(),
         )
         response = self.orchestrator_ai.send(prompt, system_prompt=system_prompt)
         return parse_orchestrator_json(response.content)
 
     def execute_action(self, action_payload: dict[str, object]) -> str:
         action = action_payload["action"]
+        requirement_id = str(action_payload.get("__requirement_id", "")).strip()
+        source_requirement_id = str(action_payload.get("_source_requirement_id", "")).strip()
+        source_requirement_info = self._find_requirement_in_graph(source_requirement_id or requirement_id)
         if action == "tables":
             return json.dumps(
                 {
@@ -624,51 +1062,111 @@ class OrchestratorSession:
         if action == "analyze_unit":
             unit_name = str(action_payload["unit_name"])
             analysis = self.analyze_unit_on_demand(unit_name)
+            structure = getattr(analysis, "structure", self._find_unit(unit_name).get_structure())
+            cache_key = f"unit:{unit_name}"
+            operational = self._build_operational_payload_for_unit(
+                unit_name=unit_name,
+                structure=structure,
+                analysis=analysis,
+                cache_key=cache_key,
+                action="analyze_unit",
+            )
             payload = {
+                "action": "analyze_unit",
+                "status": "cached",
+                "cache_key": cache_key,
                 "unit_name": unit_name,
                 "summary": summarize_tabular_analysis(analysis),
                 "metrics_summary": summarize_unit_metrics(analysis),
                 "cached": True,
                 "explored_paths": list(self.explored_paths),
-            }
+            } | operational
             self.update_knowledge_graph(payload, action="analyze_unit")
+            summary_line = summarize_tabular_analysis(analysis).splitlines()[0][:120] if analysis else unit_name
+            self._log_execution({"action": "analyze_unit", "unit": unit_name, "summary": summary_line})
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "analyze_vertical":
             unit_name = str(action_payload["unit_name"])
             depth = str(action_payload["depth"])
             cache_key = self.analyze_vertical(unit_name, depth)
-            return json.dumps(
-                {
-                    "status": "cached",
-                    "cache_key": cache_key,
-                    "message": "Cálculo vertical salvo no cache interno.",
-                },
-                ensure_ascii=False,
-                indent=2,
+            analysis = self.analysis_by_unit.get(unit_name)
+            structure = getattr(analysis, "structure", self._find_unit(unit_name).get_structure())
+            payload = self._build_operational_payload_for_unit(
+                unit_name=unit_name,
+                structure=structure,
+                analysis=analysis,
+                cache_key=cache_key,
+                action="analyze_vertical",
+                depth=depth,
             )
+            self.update_knowledge_graph(payload, action="analyze_vertical")
+            self._log_execution({"action": "analyze_vertical", "unit": unit_name, "depth": depth, "cache_key": cache_key})
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "analyze_horizontal":
             unit_a = str(action_payload["unit_a"])
             unit_b = str(action_payload["unit_b"])
-            cache_key = self.analyze_horizontal(unit_a, unit_b)
-            return json.dumps(
-                {
-                    "status": "cached",
-                    "cache_key": cache_key,
-                    "message": "Cálculo horizontal salvo no cache interno.",
-                },
-                ensure_ascii=False,
-                indent=2,
+            payload = self.analyze_horizontal(unit_a, unit_b)
+            self.update_knowledge_graph(payload, action="analyze_horizontal")
+            self._log_execution({"action": "analyze_horizontal", "unit_a": unit_a, "unit_b": unit_b, "cache_key": str(payload.get("cache_key", ""))})
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
             )
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "recall":
             key = str(action_payload["key"])
-            return json.dumps(self.recall_core_cache(key), ensure_ascii=False, indent=2, default=str)
+            payload = self.recall_core_cache(key)
+            self._log_execution({"action": "recall", "cache_key": key})
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
+            return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "schema":
             table = str(action_payload["table"])
-            return json.dumps(self._schema_for_table(table), ensure_ascii=False, indent=2)
+            result = self._schema_for_table(table)
+            self._finalize_requirement_execution(
+                result=result,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
+            return json.dumps(result, ensure_ascii=False, indent=2)
         if action == "query":
             query_id = str(action_payload["query_id"])
             payload = self._run_catalog_query(query_id)
             self.update_knowledge_graph(payload, action="query")
+            self._log_execution({"action": "query", "query_id": query_id, "sql": str(payload.get("sql", ""))[:200], "cache_key": str(payload.get("cache_key", ""))})
+            try:
+                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
+                self._create_categorical_children(last_node, payload, source_requirement_id or None)
+                textual_requirements = self._build_requirements_from_textual_clues(result=payload, source_node_id=last_node.id)
+                related_requirements = self._build_related_entity_requirements(result=payload, source_node_id=last_node.id)
+                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
+            except Exception:
+                pass
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "template":
             template_id = str(action_payload["template_id"])
@@ -678,19 +1176,168 @@ class OrchestratorSession:
             validate_sql_by_execution(self.source_path, sql)
             payload = self._validate_and_preview_sql(sql) | {"template_id": template_id, "sql": sql}
             self.update_knowledge_graph(payload, action="template")
+            self._log_execution({"action": "template", "template_id": template_id, "sql": sql[:200]})
+            try:
+                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
+                self._create_categorical_children(last_node, payload, source_requirement_id or None)
+                textual_requirements = self._build_requirements_from_textual_clues(result=payload, source_node_id=last_node.id)
+                related_requirements = self._build_related_entity_requirements(result=payload, source_node_id=last_node.id)
+                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
+            except Exception:
+                pass
+            self._finalize_requirement_execution(
+                result=payload,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
+            )
             return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if action == "request_new_query":
             description = str(action_payload["description"])
             suggested_sql = str(action_payload["suggested_sql"])
-            return json.dumps(
-                self._register_session_query(description=description, suggested_sql=suggested_sql),
-                ensure_ascii=False,
-                indent=2,
-                default=str,
+            result = self._register_session_query(description=description, suggested_sql=suggested_sql)
+            self.update_knowledge_graph(result, action="query")
+            self._log_execution({"action": "request_new_query", "description": description[:100], "sql": suggested_sql[:200], "cache_key": str(result.get("cache_key", ""))})
+            try:
+                last_node = getattr(self.knowledge_graph, "nodes", [])[-1]
+                self._create_categorical_children(last_node, result, source_requirement_id or None)
+                textual_requirements = self._build_requirements_from_textual_clues(result=result, source_node_id=last_node.id)
+                related_requirements = self._build_related_entity_requirements(result=result, source_node_id=last_node.id)
+                self._append_requirements_to_node(last_node, textual_requirements + related_requirements)
+            except Exception:
+                pass
+            self._finalize_requirement_execution(
+                result=result,
+                source_requirement_id=source_requirement_id,
+                requirement_id=requirement_id,
+                source_requirement_info=source_requirement_info,
             )
+            return json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if action == "done":
             return str(action_payload["conclusion"])
         raise ValueError(f"Ação não suportada: {action}")
+
+    def _finalize_requirement_execution(
+        self,
+        *,
+        result: dict[str, object],
+        source_requirement_id: str,
+        requirement_id: str,
+        source_requirement_info: tuple[KnowledgeNode, dict[str, object]] | None,
+    ) -> None:
+        target_requirement_id = source_requirement_id or requirement_id
+        if not target_requirement_id and str(result.get("sql", "")).strip():
+            self._resolve_matching_requirement_for_result(result)
+            matched_requirement_id = str(result.get("_matched_requirement_id", "")).strip()
+            if matched_requirement_id:
+                target_requirement_id = matched_requirement_id
+                source_requirement_info = self._find_requirement_in_graph(matched_requirement_id)
+        if target_requirement_id:
+            self.knowledge_graph.mark_requirement_resolved(target_requirement_id)
+        if source_requirement_info is not None:
+            requirement = source_requirement_info[1]
+            if str(requirement.get("role", "")).strip().lower() == "textual_clue":
+                clue_group_id = str(requirement.get("source_node_id", "")).strip()
+                if clue_group_id:
+                    active_focus = getattr(self, "_active_focus", None)
+                    if isinstance(active_focus, dict):
+                        active_focus["clue_group_id"] = clue_group_id
+        if source_requirement_info is not None and self._is_category_filter_requirement(source_requirement_info[1]):
+            last_node = getattr(self.knowledge_graph, "nodes", [])[-1] if getattr(self.knowledge_graph, "nodes", []) else None
+            if last_node is not None:
+                drilldowns = self._build_drilldown_requirements_from_filtered_result(
+                    result=result,
+                    source_requirement=source_requirement_info[1],
+                    source_node_id=last_node.id,
+                )
+                for requirement in drilldowns:
+                    if not self._requirement_exists(str(requirement.get("id", ""))):
+                        last_node.next_requirements.append(requirement)
+                self._active_focus = {
+                    "source_requirement_id": target_requirement_id,
+                    "cache_key": result.get("cache_key", ""),
+                    "units": result.get("units", []),
+                    "columns": result.get("columns", []),
+                    "filter": source_requirement_info[1].get("filter", {}),
+                    "node_id": last_node.id,
+                }
+
+    def _normalize_sql_for_requirement_match(self, sql: str) -> str:
+        normalized = " ".join(sql.strip().lower().split())
+        normalized = re.sub(r"\s*,\s*", ", ", normalized)
+        return normalized
+
+    def _filter_for_requirement(self, requirement: dict[str, object]) -> dict[str, object] | None:
+        filter_payload = requirement.get("filter")
+        if isinstance(filter_payload, dict) and str(filter_payload.get("column", "")).strip():
+            return filter_payload
+        parent_requirement_id = str(requirement.get("parent_requirement_id", "")).strip()
+        parent_requirement_info = self._find_requirement_in_graph(parent_requirement_id)
+        if parent_requirement_info is not None:
+            parent_filter = parent_requirement_info[1].get("filter")
+            if isinstance(parent_filter, dict) and str(parent_filter.get("column", "")).strip():
+                return parent_filter
+        active_focus = getattr(self, "_active_focus", None)
+        if isinstance(active_focus, dict):
+            focus_filter = active_focus.get("filter")
+            if isinstance(focus_filter, dict) and str(focus_filter.get("column", "")).strip():
+                return focus_filter
+        return None
+
+    def _requirement_matches_result(self, requirement: dict[str, object], result: dict[str, object]) -> bool:
+        suggested = requirement.get("suggested_action")
+        if not isinstance(suggested, dict):
+            return False
+        suggested_sql = str(suggested.get("suggested_sql", "")).strip()
+        result_sql = str(result.get("sql", "")).strip()
+        if not suggested_sql or not result_sql:
+            return False
+        if self._normalize_sql_for_requirement_match(suggested_sql) == self._normalize_sql_for_requirement_match(result_sql):
+            return True
+        if str(requirement.get("role", "")).strip().lower() != "drilldown":
+            return False
+        requirement_units = requirement.get("units")
+        result_units = result.get("units")
+        req_unit = str(requirement_units[0]).strip() if isinstance(requirement_units, list) and requirement_units else ""
+        result_unit = str(result_units[0]).strip() if isinstance(result_units, list) and result_units else ""
+        if req_unit and result_unit and req_unit != result_unit:
+            return False
+        filter_payload = self._filter_for_requirement(requirement)
+        if not isinstance(filter_payload, dict):
+            return False
+        filter_column = str(filter_payload.get("column", "")).strip()
+        filter_value = self._quote_sql_literal(filter_payload.get("value"))
+        if not filter_column:
+            return False
+        normalized_result_sql = self._normalize_sql_for_requirement_match(result_sql)
+        expected_filter_clause = self._normalize_sql_for_requirement_match(f"{filter_column} = {filter_value}")
+        if expected_filter_clause not in normalized_result_sql:
+            return False
+        normalized_suggested_sql = self._normalize_sql_for_requirement_match(suggested_sql)
+        for token in (
+            " is not null",
+            "trim(cast(",
+            "group by",
+            "substr(cast(",
+        ):
+            if token in normalized_suggested_sql and token in normalized_result_sql:
+                return True
+        return False
+
+    def _resolve_matching_requirement_for_result(self, result: dict[str, object]) -> bool:
+        graph = getattr(self, "knowledge_graph", None)
+        if graph is None:
+            return False
+        for requirement in graph.pending_requirements():
+            if not self._requirement_matches_result(requirement, result):
+                continue
+            requirement_id = str(requirement.get("id", "")).strip()
+            if not requirement_id:
+                continue
+            if self.knowledge_graph.mark_requirement_resolved(requirement_id):
+                result["_matched_requirement_id"] = requirement_id
+                return True
+        return False
 
     def update_knowledge_graph(self, result: dict[str, object], *, action: str) -> None:
         graph = getattr(self, "knowledge_graph", None)
@@ -755,6 +1402,22 @@ class OrchestratorSession:
         else:
             for unit_name in unexplored_units:
                 lines.append(f"- {unit_name}: não analisado")
+        lines.extend(["", "### Cache Keys"])
+        cache_keys = self.available_cache_keys()
+        if not cache_keys:
+            lines.append("- Nenhum cache registrado.")
+        else:
+            for cache_key in cache_keys:
+                lines.append(f"- {cache_key}")
+        lines.extend(["", "### Próximos Requisitos"])
+        pending_requirements = self.pending_requirements()
+        if not pending_requirements:
+            lines.append("- Nenhum requisito pendente.")
+        else:
+            for requirement in pending_requirements:
+                lines.append(
+                    f"- {requirement.get('id', '')}: {requirement.get('description', '')} [{requirement.get('status', '')}]"
+                )
         return "\n".join(lines)
 
     def _append_knowledge_lines(
@@ -771,6 +1434,35 @@ class OrchestratorSession:
             return
         visited.add(node.id)
         lines.append(f"{indent}- [{node.unit}] {node.label}")
+        graph = getattr(self, "knowledge_graph", None)
+        resolved_ids = {
+            str(requirement.get("id", "")).strip()
+            for graph_node in getattr(graph, "nodes", []) if graph is not None
+            for requirement in getattr(graph_node, "next_requirements", [])
+            if str(requirement.get("status", "")).strip() == "resolved" and str(requirement.get("id", "")).strip()
+        }
+        ordered_requirements = sort_pending_requirements_for_investigation(
+            list(node.next_requirements),
+            active_focus=getattr(self, "_active_focus", None),
+            session=self,
+            graph=graph,
+        )
+        visible_requirement_ids: set[str] = set()
+        for requirement in ordered_requirements:
+            requirement_id = str(requirement.get("id", "")).strip()
+            if (
+                requirement_id
+                and requirement_id in resolved_ids
+                and str(requirement.get("status", "")).strip() != "resolved"
+            ):
+                continue
+            if requirement_id and requirement_id in visible_requirement_ids:
+                continue
+            if requirement_id:
+                visible_requirement_ids.add(requirement_id)
+            lines.append(
+                f"{indent}  - req {requirement.get('id', '')} [{requirement.get('status', '')}] {requirement.get('description', '')}"
+            )
         for edge in children_by_parent.get(node.id, []):
             child = node_by_id.get(edge.to_id)
             if child is None:
@@ -791,12 +1483,24 @@ class OrchestratorSession:
         unit = self._infer_unit_for_knowledge(result, action=action)
         label = self._build_knowledge_label(result, action=action)
         node_id = f"{unit}:{node_index}"
+        units = [item for item in self._serialize_for_cache(result.get("units", [])) if isinstance(item, str)] if isinstance(result.get("units"), list) else ([unit] if unit and unit != "resultado" else [])
+        columns = [str(item) for item in result.get("columns", [])[:8]] if isinstance(result.get("columns"), list) else []
+        sample_entities = [str(item) for item in result.get("sample_entities", [])[:10]] if isinstance(result.get("sample_entities"), list) else extract_sample_entities(result.get("columns"), result.get("rows"), max_entities=10)
+        next_requirements = self._sanitize_requirements(result.get("next_requirements", []))
         return KnowledgeNode(
             id=node_id,
             label=label,
             unit=unit,
-            data=result,
+            data=self._sanitize_knowledge_payload(result),
             timestamp=timestamp,
+            action=action,
+            cache_key=str(result.get("cache_key", "")),
+            units=units,
+            columns=columns,
+            join_keys=[str(item) for item in result.get("join_keys", [])[:8]] if isinstance(result.get("join_keys"), list) else [],
+            sample_entities=sample_entities,
+            next_requirements=next_requirements,
+            status=str(result.get("status", "")),
         )
 
     def _infer_unit_for_knowledge(self, result: dict[str, object], *, action: str) -> str:
@@ -804,6 +1508,12 @@ class OrchestratorSession:
             unit_name = result.get("unit_name")
             if isinstance(unit_name, str) and unit_name.strip():
                 return unit_name.strip()
+        if action == "analyze_horizontal":
+            units = result.get("units")
+            if isinstance(units, list) and units:
+                first = units[0]
+                if isinstance(first, str) and first.strip():
+                    return first.strip()
         sql_fields = [
             result.get("sql"),
             result.get("from_clause"),
@@ -828,6 +1538,9 @@ class OrchestratorSession:
             query_id = str(result.get("query_id", "query")).strip()
             row_count = result.get("row_count_preview")
             return f"{query_id}: {row_count} linhas na prévia"
+        if action == "analyze_horizontal":
+            units = result.get("units", [])
+            return f"Cruzamento estrutural entre {', '.join(str(unit) for unit in units)}"
         if action == "template":
             template_id = str(result.get("template_id", "template")).strip()
             row_count = result.get("row_count_preview")
@@ -902,11 +1615,48 @@ class OrchestratorSession:
             return "query"
         return "unknown"
 
+    def _log_execution(self, entry: dict[str, object]) -> None:
+        log = getattr(self, "_execution_log", None)
+        if log is None:
+            self._execution_log = []
+            log = self._execution_log
+        normalized = {str(key): str(value) for key, value in entry.items()}
+        log.append(normalized)
+        if len(log) > 25:
+            self._execution_log = log[-25:]
+
     def _find_unit(self, unit_name: str):
         unit = next((item for item in getattr(self, "units", []) if item.unit_name == unit_name), None)
         if unit is None:
             raise ValueError(f"Unidade não encontrada: {unit_name}")
         return unit
+
+    def _find_requirement_in_graph(self, requirement_id: str) -> tuple[KnowledgeNode, dict[str, object]] | None:
+        if not requirement_id:
+            return None
+        graph = getattr(self, "knowledge_graph", None)
+        if graph is None or not hasattr(graph, "find_requirement"):
+            return None
+        return graph.find_requirement(requirement_id)
+
+    def _requirement_exists(self, requirement_id: str) -> bool:
+        normalized_id = requirement_id.strip()
+        if not normalized_id:
+            return False
+        return self._find_requirement_in_graph(normalized_id) is not None
+
+    def _append_requirements_to_node(
+        self,
+        node: KnowledgeNode,
+        requirements: list[dict[str, object]],
+    ) -> None:
+        for requirement in requirements:
+            requirement_id = str(requirement.get("id", "")).strip()
+            if not requirement_id:
+                continue
+            if self._requirement_exists(requirement_id):
+                continue
+            node.next_requirements.append(requirement)
 
     def _set_core_cache(self, key: str, payload: object) -> None:
         cache = getattr(self, "_core_cache", None)
@@ -962,6 +1712,146 @@ class OrchestratorSession:
                 result[column.name].add(str(value))
         return result
 
+    def _infer_join_keys(self, unit_a: str, structure_a: object, unit_b: str, structure_b: object) -> list[str]:
+        columns_a = {column.name for column in getattr(structure_a, "columns", ())}
+        columns_b = {column.name for column in getattr(structure_b, "columns", ())}
+        candidates: list[tuple[str, str]] = []
+        for same_name in sorted(columns_a & columns_b):
+            normalized = normalize_identifier(same_name)
+            if normalized.endswith("id") or normalized.endswith("key") or normalized.endswith("code") or normalized.endswith("ssn"):
+                candidates.append((f"{unit_a}.{same_name}", f"{unit_b}.{same_name}"))
+        for column_name in sorted(columns_a):
+            if not column_name.endswith("_id"):
+                continue
+            prefix = column_name[:-3]
+            if "id" in columns_b and normalize_entity_name(unit_b) == normalize_entity_name(prefix):
+                candidates.append((f"{unit_a}.{column_name}", f"{unit_b}.id"))
+        for column_name in sorted(columns_b):
+            if not column_name.endswith("_id"):
+                continue
+            prefix = column_name[:-3]
+            if "id" in columns_a and normalize_entity_name(unit_a) == normalize_entity_name(prefix):
+                candidates.append((f"{unit_b}.{column_name}", f"{unit_a}.id"))
+        for same_name in sorted(columns_a & columns_b):
+            if same_name in {"id"}:
+                continue
+            candidates.append((f"{unit_a}.{same_name}", f"{unit_b}.{same_name}"))
+        unique = []
+        seen = set()
+        for left, right in candidates:
+            key = f"{left}={right}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(key)
+        return unique
+
+    def _find_compatible_units(self, unit_name: str, columns: list[str]) -> list[str]:
+        compatible: list[str] = []
+        normalized_columns = {normalize_identifier(column) for column in columns}
+        for unit in getattr(self, "units", []):
+            if unit.unit_name == unit_name:
+                continue
+            try:
+                structure = unit.get_structure()
+            except Exception:
+                continue
+            other_columns = _column_names_from_structure(structure)
+            overlap = normalized_columns & {normalize_identifier(column) for column in other_columns}
+            if overlap:
+                compatible.append(unit.unit_name)
+        return compatible
+
+    def _is_category_filter_requirement(self, requirement: dict[str, object]) -> bool:
+        if str(requirement.get("role", "")).strip() == "category_filter":
+            return True
+        filter_payload = requirement.get("filter")
+        return isinstance(filter_payload, dict) and bool(str(filter_payload.get("column", "")).strip())
+
+    def _build_select_columns_for_filtered_query(self, table: str, filter_column: str) -> str:
+        try:
+            structure = self._find_unit(table).get_structure()
+            classified = classify_columns_from_structure(structure)
+            columns = classified["columns"]
+            prioritized: list[str] = []
+            for group_name in (
+                "candidate_key_columns",
+                "datetime_like_columns",
+                "categorical_columns",
+                "text_columns",
+            ):
+                for column in classified.get(group_name, []):
+                    if column not in prioritized:
+                        prioritized.append(column)
+            for column in columns:
+                if column not in prioritized:
+                    prioritized.append(column)
+            selected = [column for column in prioritized if column != filter_column][:8]
+            if filter_column not in selected and len(selected) < 8:
+                selected.append(filter_column)
+            if not selected:
+                return "*"
+            return ", ".join(selected[:8])
+        except Exception:
+            return "*"
+
+    def _build_horizontal_requirements(self, payload: dict[str, object]) -> list[dict[str, object]]:
+        units = list(payload.get("units", []))
+        join_keys = list(payload.get("join_keys", []))
+        if len(units) != 2 or not join_keys:
+            return []
+        first_join = join_keys[0]
+        if "=" not in first_join:
+            return []
+        left, right = first_join.split("=", 1)
+        left_unit, left_column = left.split(".", 1)
+        right_unit, right_column = right.split(".", 1)
+        sql = (
+            f"SELECT * FROM {left_unit} a "
+            f"JOIN {right_unit} b ON a.{left_column} = b.{right_column} "
+            "LIMIT 50"
+        )
+        return [
+            {
+                "id": f"req_{left_unit}_{right_unit}_{left_column}_{right_column}",
+                "kind": "query",
+                "units": units,
+                "description": f"Executar JOIN entre {left_unit} e {right_unit}",
+                "reason": "join_keys observadas na análise horizontal",
+                "suggested_action": {
+                    "action": "request_new_query",
+                    "description": f"cruzar {left_unit} com {right_unit}",
+                    "suggested_sql": sql,
+                },
+                "status": "pending",
+                "source_node_id": "",
+            }
+        ]
+
+    def _sanitize_knowledge_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        sanitized = {str(key): self._serialize_for_cache(value) for key, value in payload.items() if key != "rows"}
+        if "sample_entities" not in sanitized:
+            sanitized["sample_entities"] = extract_sample_entities(payload.get("columns"), payload.get("rows"), max_entities=10)
+        return sanitized
+
+    def _sanitize_requirements(self, requirements: object) -> list[dict[str, object]]:
+        if not isinstance(requirements, list):
+            return []
+        sanitized: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for item in requirements:
+            if not isinstance(item, dict):
+                continue
+            requirement = {str(key): self._serialize_for_cache(value) for key, value in item.items()}
+            requirement_id = str(requirement.get("id", "")).strip()
+            if requirement_id:
+                if requirement_id in seen_ids:
+                    continue
+                if self._requirement_exists(requirement_id):
+                    continue
+                seen_ids.add(requirement_id)
+            sanitized.append(requirement)
+        return sanitized
+
     def _schema_for_table(self, table_name: str) -> dict[str, object]:
         unit = next((item for item in self.units if item.unit_name == table_name), None)
         if unit is None:
@@ -990,14 +1880,30 @@ class OrchestratorSession:
             cursor = connection.execute(sql)
             column_names = [item[0] for item in cursor.description or ()]
             rows = cursor.fetchmany(200)
-        return {
+        payload = {
+            "cache_key": f"query:{query_id}",
             "query_id": query_id,
+            "action": "query",
+            "status": "cached",
             "sql": sql,
+            "units": extract_units_from_sql(sql),
             "columns": column_names,
             "rows": rows,
             "row_count_preview": len(rows),
             "truncated": len(rows) == 200,
         }
+        payload |= build_operational_summary_for_query(
+            action="query",
+            cache_key=str(payload["cache_key"]),
+            units=list(payload["units"]),
+            columns=column_names,
+            rows=rows,
+            row_count_preview=len(rows),
+            truncated=bool(payload["truncated"]),
+            query_id=query_id,
+        )
+        self._set_core_cache(str(payload["cache_key"]), payload)
+        return payload
 
     def catalog_for_session(self) -> dict[str, str]:
         return {
@@ -1016,16 +1922,33 @@ class OrchestratorSession:
         candidate = (query_id, validated_sql)
         if candidate not in self._candidate_queries:
             self._candidate_queries.append(candidate)
-        return {
+        units = extract_units_from_sql(validated_sql)
+        payload = {
+            "action": "request_new_query",
+            "status": "cached",
+            "cache_key": f"query:{query_id}",
             "query_id": query_id,
             "description": description.strip(),
             "sql": validated_sql,
+            "units": units,
             "columns": preview["columns"],
             "rows": preview["rows"],
             "row_count_preview": preview["row_count_preview"],
             "truncated": preview["truncated"],
             "registered_in_session": True,
         }
+        payload |= build_operational_summary_for_query(
+            action="request_new_query",
+            cache_key=str(payload["cache_key"]),
+            units=units,
+            columns=preview["columns"],
+            rows=preview["rows"],
+            row_count_preview=int(preview["row_count_preview"]),
+            truncated=bool(preview["truncated"]),
+            query_id=query_id,
+        )
+        self._set_core_cache(str(payload["cache_key"]), payload)
+        return payload
 
     def _validate_and_preview_sql(self, sql: str) -> dict[str, object]:
         with sqlite3.connect(self.source_path) as connection:
@@ -1040,6 +1963,602 @@ class OrchestratorSession:
             "row_count_preview": len(rows),
             "truncated": len(rows) == 200,
         }
+
+    def _quote_sql_literal(self, value: object) -> str:
+        if value is None:
+            return "NULL"
+        if isinstance(value, (int, float)):
+            return str(value)
+        s = str(value)
+        s = s.replace("'", "''")
+        return f"'{s}'"
+
+    def _detect_categorical_distribution(self, payload: dict[str, object]) -> dict | None:
+        rows = payload.get("rows") or []
+        if not rows:
+            return None
+        columns = payload.get("columns") or []
+        if not columns or len(columns) < 2:
+            return None
+        sql_text = str(payload.get("sql", "") or "")
+        sql_upper = sql_text.upper()
+        count_names = {"total", "count", "qtd", "quantidade", "n", "cnt"}
+        count_idx = None
+        for idx, col in enumerate(columns):
+            if str(col).strip().lower() in count_names:
+                count_idx = idx
+                break
+        cat_idx = None
+        for idx, col in enumerate(columns):
+            if idx == count_idx:
+                continue
+            cat_idx = idx
+            break
+        # try infer count column by sample numeric values
+        if count_idx is None:
+            for idx in range(len(columns)):
+                if idx == 0:
+                    continue
+                try:
+                    sample = rows[0][idx]
+                except Exception:
+                    continue
+                if isinstance(sample, (int, float)):
+                    count_idx = idx
+                    cat_idx = 0 if cat_idx is None else cat_idx
+                    break
+        if cat_idx is None or count_idx is None:
+            return None
+        # require GROUP BY or numeric counts in sample
+        if "GROUP BY" not in sql_upper:
+            numeric_sample = False
+            for r in rows[:5]:
+                try:
+                    if isinstance(r[count_idx], (int, float)):
+                        numeric_sample = True
+                        break
+                except Exception:
+                    continue
+            if not numeric_sample:
+                return None
+        units = payload.get("units") or []
+        table = units[0] if isinstance(units, list) and units else None
+        if not table:
+            m = re.search(r"\bFROM\s+([A-Za-z0-9_\".]+)", str(payload.get("sql", "")), flags=re.IGNORECASE)
+            if m:
+                table = m.group(1).strip('"')
+        return {"category_col": columns[cat_idx], "count_col": columns[count_idx], "table": table, "rows": rows}
+
+    def _create_categorical_children(self, node: "KnowledgeNode", payload: dict[str, object], source_requirement_id: str | None) -> None:
+        info = self._detect_categorical_distribution(payload)
+        if not info:
+            return
+        columns = payload.get("columns") or []
+        rows = info.get("rows") or []
+        try:
+            count_idx = columns.index(info["count_col"])
+        except Exception:
+            count_idx = 1 if len(columns) > 1 else 0
+        try:
+            cat_idx = columns.index(info["category_col"])
+        except Exception:
+            cat_idx = 0
+        # sort rows by count descending when possible
+        def _row_count_val(r):
+            try:
+                v = r[count_idx]
+                return float(v) if isinstance(v, (int, float)) else float(str(v).replace(',', ''))
+            except Exception:
+                return 0.0
+        sorted_rows = sorted(rows, key=_row_count_val, reverse=True)
+        top_n = min(5, len(sorted_rows))
+        category = info["category_col"]
+        count_col = info["count_col"]
+        table = info.get("table") or (payload.get("units") or [None])[0] or "unknown"
+        relevant_columns_list = [c for c in columns if c != count_col][:5]
+        relevant_columns = ", ".join(relevant_columns_list) if relevant_columns_list else "*"
+        for row in sorted_rows[:top_n]:
+            value = row[cat_idx]
+            safe = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")[:40] or "v"
+            req_id = f"req_{table}_{category}_{safe}"
+            if self._requirement_exists(req_id):
+                continue
+            quoted = self._quote_sql_literal(value)
+            selected_columns = self._build_select_columns_for_filtered_query(str(table), str(category))
+            suggested_sql = f"SELECT {selected_columns} FROM {table} WHERE {category} = {quoted} LIMIT 50"
+            new_req = {
+                "id": req_id,
+                "kind": "query",
+                "units": [table],
+                "description": f"Explorar registros onde {category} = {value}",
+                "reason": f"A distribuição por {category} mostrou esse valor entre os principais.",
+                "role": "category_filter",
+                "parent_requirement_id": source_requirement_id or "",
+                "filter": {
+                    "column": category,
+                    "value": value,
+                    "operator": "=",
+                },
+                "suggested_action": {
+                    "action": "request_new_query",
+                    "description": f"explorar registros filtrados por {category}",
+                    "suggested_sql": suggested_sql,
+                },
+                "status": "pending",
+                "source_node_id": node.id,
+            }
+            node.next_requirements.append(new_req)
+
+    def _build_drilldown_requirements_from_filtered_result(
+        self,
+        *,
+        result: dict[str, object],
+        source_requirement: dict[str, object] | None,
+        source_node_id: str,
+    ) -> list[dict[str, object]]:
+        if not source_requirement:
+            return []
+        units = result.get("units", [])
+        if not isinstance(units, list) or not units:
+            return []
+        table = str(units[0]).strip()
+        if not table:
+            return []
+        filter_payload = source_requirement.get("filter", {})
+        if not isinstance(filter_payload, dict):
+            return []
+        filter_column = str(filter_payload.get("column", "")).strip()
+        if not filter_column:
+            return []
+        source_requirement_id = str(source_requirement.get("id", "")).strip()
+        filter_sql = f"{filter_column} = {self._quote_sql_literal(filter_payload.get('value'))}"
+        requirements: list[dict[str, object]] = []
+        try:
+            structure = self._find_unit(table).get_structure()
+            classified = classify_columns_from_structure(structure)
+        except Exception:
+            classified = {
+                "columns": [str(item) for item in result.get("columns", []) if isinstance(item, str)],
+                "candidate_key_columns": detect_candidate_key_columns(list(result.get("columns", []))),
+                "categorical_columns": [column for column in detect_categorical_columns(list(result.get("columns", []))) if column != filter_column],
+                "numeric_columns": detect_numeric_columns(list(result.get("columns", []))),
+                "text_columns": [column for column in detect_text_columns(list(result.get("columns", []))) if column != filter_column],
+                "datetime_like_columns": detect_datetime_like_columns(list(result.get("columns", []))),
+            }
+
+        def append_requirement(requirement: dict[str, object]) -> None:
+            requirement["role"] = "drilldown"
+            requirement["parent_requirement_id"] = source_requirement_id
+            requirement["source_node_id"] = source_node_id
+            requirement["status"] = "pending"
+            if not self._requirement_exists(str(requirement.get("id", ""))):
+                requirements.append(requirement)
+
+        text_columns = [column for column in classified.get("text_columns", []) if column != filter_column]
+        if text_columns:
+            sample_columns = list(dict.fromkeys((classified.get("candidate_key_columns", []) + text_columns)[:4]))
+            select_clause = ", ".join(sample_columns) if sample_columns else "*"
+            text_column = text_columns[0]
+            append_requirement(
+                {
+                    "id": f"req_{table}_{filter_column}_text_{re.sub(r'[^a-z0-9]+', '_', text_column.lower()).strip('_') or 'text'}",
+                    "kind": "query",
+                    "units": [table],
+                    "description": f"Amostrar textos em {table} dentro do filtro atual",
+                    "reason": "colunas textuais disponíveis no resultado filtrado",
+                    "suggested_action": {
+                        "action": "request_new_query",
+                        "description": f"amostrar textos filtrados por {filter_column}",
+                        "suggested_sql": (
+                            f"SELECT {select_clause} FROM {table} "
+                            f"WHERE {filter_sql} AND {text_column} IS NOT NULL "
+                            f"AND TRIM(CAST({text_column} AS TEXT)) <> '' LIMIT 50"
+                        ),
+                    },
+                }
+            )
+
+        other_categorical = [column for column in classified.get("categorical_columns", []) if column != filter_column]
+        if other_categorical:
+            category_column = other_categorical[0]
+            append_requirement(
+                {
+                    "id": f"req_{table}_{filter_column}_group_{re.sub(r'[^a-z0-9]+', '_', category_column.lower()).strip('_') or 'group'}",
+                    "kind": "query",
+                    "units": [table],
+                    "description": f"Agrupar o recorte atual por {category_column}",
+                    "reason": "há outras colunas categóricas para aprofundar dentro do filtro",
+                    "suggested_action": {
+                        "action": "request_new_query",
+                        "description": f"agrupar dentro do filtro por {category_column}",
+                        "suggested_sql": (
+                            f"SELECT {category_column}, COUNT(*) AS total FROM {table} "
+                            f"WHERE {filter_sql} AND {category_column} IS NOT NULL "
+                            f"AND TRIM(CAST({category_column} AS TEXT)) <> '' "
+                            f"GROUP BY {category_column} ORDER BY total DESC LIMIT 50"
+                        ),
+                    },
+                }
+            )
+
+        datetime_columns = classified.get("datetime_like_columns", [])
+        if datetime_columns:
+            datetime_column = datetime_columns[0]
+            append_requirement(
+                {
+                    "id": f"req_{table}_{filter_column}_time_{re.sub(r'[^a-z0-9]+', '_', datetime_column.lower()).strip('_') or 'time'}",
+                    "kind": "query",
+                    "units": [table],
+                    "description": f"Agrupar o recorte atual por período em {datetime_column}",
+                    "reason": "há coluna temporal no resultado filtrado",
+                    "suggested_action": {
+                        "action": "request_new_query",
+                        "description": f"agrupar dentro do filtro por período",
+                        "suggested_sql": (
+                            f"SELECT substr(CAST({datetime_column} AS TEXT), 1, 10) AS period, COUNT(*) AS total "
+                            f"FROM {table} WHERE {filter_sql} AND {datetime_column} IS NOT NULL "
+                            f"GROUP BY period ORDER BY period LIMIT 50"
+                        ),
+                    },
+                }
+            )
+
+        compatible_units = self._find_compatible_units(table, classified.get("candidate_key_columns", []) or classified.get("columns", []))
+        if compatible_units:
+            append_requirement(
+                {
+                    "id": f"req_{table}_cross_{re.sub(r'[^a-z0-9]+', '_', compatible_units[0].lower()).strip('_') or 'unit'}",
+                    "kind": "analyze_horizontal",
+                    "units": [table, compatible_units[0]],
+                    "description": f"Cruzar o recorte atual com {compatible_units[0]}",
+                    "reason": "há outra unidade com colunas compatíveis por chave",
+                    "suggested_action": {
+                        "action": "analyze_horizontal",
+                        "unit_a": table,
+                        "unit_b": compatible_units[0],
+                    },
+                }
+            )
+
+        return requirements
+
+    def _person_like_units(self) -> list[tuple[str, dict[str, str]]]:
+        matches: list[tuple[str, dict[str, str]]] = []
+        for unit in getattr(self, "units", []):
+            try:
+                structure = unit.get_structure()
+            except Exception:
+                continue
+            columns = _column_names_from_structure(structure)
+            normalized = {column.lower(): column for column in columns}
+            has_name = any(key in normalized for key in ("name",))
+            has_street_name = any(key in normalized for key in ("address_street_name", "street_name"))
+            has_address_number = "address_number" in normalized
+            has_generic_address = any(key in normalized for key in ("address", "street"))
+            has_identity = any(key in normalized for key in ("person_id", "id"))
+            if not ((has_name or has_identity) and (has_street_name or has_generic_address)):
+                continue
+            mapping: dict[str, str] = {}
+            for key in ("name", "address_street_name", "street_name", "address_number", "address", "street", "person_id", "id"):
+                if key in normalized:
+                    mapping[key] = normalized[key]
+            matches.append((unit.unit_name, mapping))
+        return matches
+
+    def _textual_clue_columns(self, columns: list[str]) -> list[str]:
+        preferred = ("description", "transcript", "text", "note", "content", "summary", "details")
+        selected: list[str] = []
+        for column in columns:
+            lowered = column.lower()
+            if any(token in lowered for token in preferred):
+                selected.append(column)
+        if selected:
+            return selected
+        return [column for column in columns if any(token in column.lower() for token in ("desc", "text", "note", "content", "detail", "summary"))]
+
+    def _build_requirements_from_textual_clues(
+        self,
+        *,
+        result: dict[str, object],
+        source_node_id: str,
+    ) -> list[dict[str, object]]:
+        columns = [str(item) for item in result.get("columns", [])] if isinstance(result.get("columns"), list) else []
+        rows = result.get("rows", [])
+        units = result.get("units", [])
+        if not columns or not isinstance(rows, list) or not isinstance(units, list) or not units:
+            return []
+        clue_columns = self._textual_clue_columns(columns)
+        if not clue_columns:
+            return []
+        person_like_units = self._person_like_units()
+        if not person_like_units:
+            return []
+
+        def append_requirement(requirement: dict[str, object], bucket: list[dict[str, object]]) -> None:
+            if not self._requirement_exists(str(requirement.get("id", ""))):
+                bucket.append(requirement)
+
+        requirements: list[dict[str, object]] = []
+        patterns = {
+            "last_house": re.compile(r'last house on\s+(["\'])(.*?)\1', flags=re.IGNORECASE),
+            "named": re.compile(r"\bnamed\s+([A-Za-z][A-Za-z0-9' -]+?)(?:,|\s+lives|\s+live|\.|$)", flags=re.IGNORECASE),
+            "lives_somewhere": re.compile(r'lives somewhere on\s+(["\'])(.*?)\1', flags=re.IGNORECASE),
+            "lives_on": re.compile(r'lives (?:at|on)\s+(["\'])(.*?)\1', flags=re.IGNORECASE),
+        }
+
+        for row in rows[:20]:
+            if not isinstance(row, (list, tuple)):
+                continue
+            for clue_column in clue_columns:
+                try:
+                    clue_index = columns.index(clue_column)
+                except ValueError:
+                    continue
+                if clue_index >= len(row) or row[clue_index] is None:
+                    continue
+                text = str(row[clue_index])
+                if not text.strip():
+                    continue
+                last_house_streets = [match[1].strip() for match in patterns["last_house"].findall(text)]
+                named_people = [match.strip() for match in patterns["named"].findall(text)]
+                somewhere_streets = [match[1].strip() for match in patterns["lives_somewhere"].findall(text)]
+                generic_streets = [match[1].strip() for match in patterns["lives_on"].findall(text)]
+
+                for unit_name, mapping in person_like_units:
+                    street_column = mapping.get("address_street_name") or mapping.get("street_name") or mapping.get("street") or mapping.get("address")
+                    number_column = mapping.get("address_number")
+                    name_column = mapping.get("name")
+                    if not street_column:
+                        continue
+                    for street in last_house_streets:
+                        safe = re.sub(r"[^a-z0-9]+", "_", street.lower()).strip("_")[:40] or "street"
+                        sql = (
+                            f"SELECT * FROM {unit_name} WHERE {street_column} = {self._quote_sql_literal(street)} "
+                            f"{f'ORDER BY {number_column} DESC ' if number_column else ''}LIMIT 1"
+                        )
+                        append_requirement(
+                            {
+                                "id": f"req_{source_node_id}_clue_last_house_{safe}",
+                                "kind": "query",
+                                "role": "textual_clue",
+                                "units": [unit_name],
+                                "description": f"Buscar última residência em {street}",
+                                "reason": "pista textual extraída de resultado anterior",
+                                "source_node_id": source_node_id,
+                                "suggested_action": {
+                                    "action": "request_new_query",
+                                    "description": f"buscar última casa em {street}",
+                                    "suggested_sql": sql,
+                                },
+                                "status": "pending",
+                            },
+                            requirements,
+                        )
+                    for street in somewhere_streets + generic_streets:
+                        safe = re.sub(r"[^a-z0-9]+", "_", street.lower()).strip("_")[:40] or "street"
+                        if name_column and named_people:
+                            for person_name in named_people:
+                                name_safe = re.sub(r"[^a-z0-9]+", "_", person_name.lower()).strip("_")[:24] or "name"
+                                escaped_name = str(person_name).replace("'", "''")
+                                sql = (
+                                    f"SELECT * FROM {unit_name} WHERE {name_column} LIKE '%{escaped_name}%' "
+                                    f"AND {street_column} = {self._quote_sql_literal(street)} LIMIT 50"
+                                )
+                                append_requirement(
+                                    {
+                                        "id": f"req_{source_node_id}_clue_named_{name_safe}_{safe}",
+                                        "kind": "query",
+                                        "role": "textual_clue",
+                                        "units": [unit_name],
+                                        "description": f"Buscar {person_name} em {street}",
+                                        "reason": "pista textual extraída de resultado anterior",
+                                        "source_node_id": source_node_id,
+                                        "suggested_action": {
+                                            "action": "request_new_query",
+                                            "description": f"buscar {person_name} em {street}",
+                                            "suggested_sql": sql,
+                                        },
+                                        "status": "pending",
+                                    },
+                                    requirements,
+                                )
+                        sql = f"SELECT * FROM {unit_name} WHERE {street_column} = {self._quote_sql_literal(street)} LIMIT 50"
+                        append_requirement(
+                            {
+                                "id": f"req_{source_node_id}_clue_street_{safe}",
+                                "kind": "query",
+                                "role": "textual_clue",
+                                "units": [unit_name],
+                                "description": f"Buscar pessoas relacionadas a {street}",
+                                "reason": "pista textual extraída de resultado anterior",
+                                "source_node_id": source_node_id,
+                                "suggested_action": {
+                                    "action": "request_new_query",
+                                    "description": f"buscar pessoas em {street}",
+                                    "suggested_sql": sql,
+                                },
+                                "status": "pending",
+                            },
+                            requirements,
+                        )
+        return requirements
+
+    def _build_related_entity_requirements(
+        self,
+        *,
+        result: dict[str, object],
+        source_node_id: str,
+    ) -> list[dict[str, object]]:
+        columns = [str(item) for item in result.get("columns", [])] if isinstance(result.get("columns"), list) else []
+        rows = result.get("rows", [])
+        units = result.get("units", [])
+        if not columns or not isinstance(rows, list) or not isinstance(units, list) or len(units) != 1:
+            return []
+        if len(rows) == 0 or len(rows) > 5:
+            return []
+        source_unit = str(units[0]).strip()
+        if not source_unit:
+            return []
+
+        source_entity = normalize_entity_name(source_unit)
+        source_structure = None
+        try:
+            source_structure = self._find_unit(source_unit).get_structure()
+        except Exception:
+            source_structure = None
+        source_columns = _column_names_from_structure(source_structure) if source_structure is not None else columns
+        source_column_set = {column.lower() for column in source_columns}
+
+        observed_keys: list[dict[str, object]] = []
+        seen_observed: set[tuple[str, str]] = set()
+        for row in rows[:5]:
+            if not isinstance(row, (list, tuple)):
+                continue
+            for index, column in enumerate(columns):
+                if index >= len(row):
+                    continue
+                value = row[index]
+                if value is None or str(value).strip() == "":
+                    continue
+                normalized_column = str(column).strip().lower()
+                if not (
+                    normalized_column == "id"
+                    or normalized_column.endswith("_id")
+                    or normalized_column.endswith("_key")
+                    or normalized_column.endswith("_code")
+                    or normalized_column in {"key", "ssn", "code"}
+                ):
+                    continue
+                dedupe_key = (normalized_column, str(value).strip())
+                if dedupe_key in seen_observed:
+                    continue
+                seen_observed.add(dedupe_key)
+                observed_keys.append(
+                    {
+                        "column": str(column).strip(),
+                        "normalized_column": normalized_column,
+                        "value": value,
+                    }
+                )
+        if not observed_keys:
+            return []
+
+        executed_filters: set[tuple[str, str, str]] = set()
+        graph = getattr(self, "knowledge_graph", None)
+        if graph is not None:
+            for node in getattr(graph, "nodes", []):
+                node_units = getattr(node, "units", []) or ([getattr(node, "unit", "")] if getattr(node, "unit", "") else [])
+                node_unit = str(node_units[0]).strip() if node_units else ""
+                for requirement in getattr(node, "next_requirements", []):
+                    suggested = requirement.get("suggested_action")
+                    if not isinstance(suggested, dict):
+                        continue
+                    sql = str(suggested.get("suggested_sql", "")).strip()
+                    if not sql:
+                        continue
+                    extracted_units = extract_units_from_sql(sql)
+                    target_unit = str(extracted_units[0]).strip() if extracted_units else node_unit
+                    filter_payload = requirement.get("filter")
+                    if isinstance(filter_payload, dict):
+                        filter_column = str(filter_payload.get("column", "")).strip().lower()
+                        filter_value = str(filter_payload.get("value", "")).strip()
+                        if target_unit and filter_column and filter_value:
+                            executed_filters.add((target_unit, filter_column, filter_value))
+                    if str(requirement.get("status", "")).strip().lower() == "resolved":
+                        sql_match = re.search(
+                            r"\bWHERE\s+([A-Za-z0-9_]+)\s*=\s*(?:'([^']*(?:''[^']*)*)'|([0-9]+(?:\.[0-9]+)?))",
+                            sql,
+                            flags=re.IGNORECASE,
+                        )
+                        if sql_match and target_unit:
+                            raw_value = sql_match.group(2) if sql_match.group(2) is not None else sql_match.group(3)
+                            if raw_value is not None:
+                                executed_filters.add(
+                                    (
+                                        target_unit,
+                                        sql_match.group(1).strip().lower(),
+                                        raw_value.replace("''", "'").strip(),
+                                    )
+                                )
+
+        requirements: list[dict[str, object]] = []
+        seen_targets: set[tuple[str, str, str]] = set()
+        for unit in getattr(self, "units", []):
+            target_unit = str(getattr(unit, "unit_name", "")).strip()
+            if not target_unit or target_unit == source_unit:
+                continue
+            try:
+                target_structure = unit.get_structure()
+            except Exception:
+                continue
+            target_columns = _column_names_from_structure(target_structure)
+            normalized_target_columns = {column.lower(): column for column in target_columns}
+            target_entity = normalize_entity_name(target_unit)
+
+            for observed in observed_keys:
+                observed_column = str(observed["column"])
+                normalized_observed_column = str(observed["normalized_column"])
+                observed_value = observed["value"]
+                observed_value_text = str(observed_value).strip()
+                if not observed_value_text:
+                    continue
+
+                candidate_target_columns: list[str] = []
+                if normalized_observed_column == "id":
+                    for candidate in (
+                        f"{source_entity}_id",
+                        f"{source_entity}id",
+                        f"{source_entity}_key",
+                        f"{source_entity}key",
+                        source_entity,
+                    ):
+                        match = normalized_target_columns.get(candidate)
+                        if match and match not in candidate_target_columns:
+                            candidate_target_columns.append(match)
+                elif normalized_observed_column in {"ssn", "code", "key"} or normalized_observed_column.endswith(("_id", "_key", "_code")):
+                    same_name = normalized_target_columns.get(normalized_observed_column)
+                    if same_name and same_name not in candidate_target_columns:
+                        candidate_target_columns.append(same_name)
+                    if normalized_observed_column.endswith(("_id", "_key", "_code")):
+                        prefix = normalize_entity_name(observed_column)
+                        if prefix and prefix == target_entity:
+                            target_id = normalized_target_columns.get("id")
+                            if target_id and target_id not in candidate_target_columns:
+                                candidate_target_columns.append(target_id)
+
+                for target_column in candidate_target_columns:
+                    target_key = (target_unit, target_column.lower(), observed_value_text)
+                    if target_key in seen_targets or target_key in executed_filters:
+                        continue
+                    if target_unit == source_unit and target_column.lower() in source_column_set:
+                        continue
+                    seen_targets.add(target_key)
+                    safe_target_unit = re.sub(r"[^a-z0-9]+", "_", target_unit.lower()).strip("_") or "unit"
+                    safe_target_column = re.sub(r"[^a-z0-9]+", "_", target_column.lower()).strip("_") or "column"
+                    safe_value = re.sub(r"[^a-z0-9]+", "_", observed_value_text.lower()).strip("_")[:40] or "value"
+                    select_clause = self._build_select_columns_for_filtered_query(target_unit, target_column)
+                    requirements.append(
+                        {
+                            "id": f"req_{source_node_id}_related_{safe_target_unit}_{safe_target_column}_{safe_value}",
+                            "kind": "query",
+                            "role": "related_entity",
+                            "units": [target_unit],
+                            "description": f"Consultar registros relacionados por {target_column} = {observed_value_text}",
+                            "reason": "chave observada em entidade retornada",
+                            "source_node_id": source_node_id,
+                            "suggested_action": {
+                                "action": "request_new_query",
+                                "description": f"consultar relacionados em {target_unit} por {target_column}",
+                                "suggested_sql": (
+                                    f"SELECT {select_clause} FROM {target_unit} "
+                                    f"WHERE {target_column} = {self._quote_sql_literal(observed_value)} LIMIT 50"
+                                ),
+                            },
+                            "status": "pending",
+                        }
+                    )
+
+        return requirements
 
 
 def detect_source_type(source_path: str) -> str:
@@ -1075,7 +2594,54 @@ def build_interface_prompt(
     result_context: str,
     structural_context: str,
     is_first_call: bool,
+    pending_requirements: list[dict[str, object]] | None = None,
 ) -> str:
+    def _has_structural_analysis_context() -> bool:
+        context_text = " ".join(
+            part for part in (result_context or "", structural_context or "") if isinstance(part, str)
+        )
+        markers = (
+            "row_count",
+            "columns",
+            "evidence",
+            "operational_summary",
+            "next_requirements",
+            "pending_requirements",
+            "candidate_key_columns",
+            "categorical_columns",
+            "numeric_columns",
+            "text_columns",
+        )
+        return any(marker in context_text for marker in markers)
+
+    def _format_pending_requirement(requirement: dict[str, object]) -> dict[str, object]:
+        suggested_action = requirement.get("suggested_action")
+        suggested_summary = {}
+        if isinstance(suggested_action, dict):
+            suggested_summary = {
+                "action": str(suggested_action.get("action", "")).strip(),
+                "description": str(suggested_action.get("description", "")).strip(),
+            }
+        return {
+            "id": str(requirement.get("id", "")).strip(),
+            "kind": str(requirement.get("kind", "")).strip(),
+            "role": str(requirement.get("role", "")).strip(),
+            "units": [str(unit) for unit in requirement.get("units", [])] if isinstance(requirement.get("units", []), list) else [],
+            "description": str(requirement.get("description", "")).strip(),
+            "suggested_action": suggested_summary,
+        }
+
+    ordered_pending = pending_requirements or []
+    non_schema_pending = [
+        requirement for requirement in ordered_pending
+        if str(requirement.get("kind", "")).strip().lower() != "schema"
+    ]
+    schema_pending = [
+        requirement for requirement in ordered_pending
+        if str(requirement.get("kind", "")).strip().lower() == "schema"
+    ]
+    readable_pending = [_format_pending_requirement(req) for req in [*non_schema_pending, *schema_pending]]
+
     payload = {
         "source_path": source_path,
         "source_type": source_type,
@@ -1085,6 +2651,16 @@ def build_interface_prompt(
         "structural_context": structural_context,
         "user_message": user_text,
         "available_result": result_context,
+        "pending_requirements": readable_pending,
+        "interface_rules": {
+            "avoid_redundant_schema_after_analysis": _has_structural_analysis_context(),
+            "instruction": (
+                "Se já houver contexto estrutural suficiente e pending_requirements úteis, "
+                "NÃO sugira schema/estrutura/colunas como próximo passo principal; "
+                "priorize o primeiro pending_requirement operacional não-schema. "
+                "Só mencione schema se o usuário pedir explicitamente ou se for o único caminho útil."
+            ),
+        },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1101,9 +2677,13 @@ def build_orchestrator_prompt(
     is_first_call: bool,
     last_error: str | None = None,
     last_result: str | None = None,
-    executed_queries: list[str] | None = None,
+    executed_queries: list[object] | None = None,
     query_catalog: list[str] | None = None,
     attempt_number: int = 1,
+    execution_log: list[dict[str, str]] | None = None,
+    knowledge_graph_context: str = "",
+    available_cache_keys: list[str] | None = None,
+    pending_requirements: list[dict[str, object]] | None = None,
 ) -> str:
     payload = {
         "source_path": source_path,
@@ -1117,6 +2697,11 @@ def build_orchestrator_prompt(
         "structural_context": structural_context if is_first_call else compact_structural_context,
         "last_error": last_error or "",
         "last_result": last_result or "",
+        "last_result_summary": (last_result or "")[:300],
+        "execution_log": execution_log or [],
+        "knowledge_graph_context": knowledge_graph_context,
+        "available_cache_keys": available_cache_keys or [],
+        "pending_requirements": pending_requirements or [],
         "executed_queries": executed_queries or [],
         "query_catalog": query_catalog or sorted(set(QUERY_CATALOG.keys())),
         "analytic_templates": sorted(ANALYTIC_TEMPLATES.keys()),
@@ -1290,6 +2875,245 @@ def detect_analysis_intent(user_text: str) -> str:
     return "unknown"
 
 
+def extract_sample_entities(columns: object, rows: object, max_entities: int = 10) -> list[str]:
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return []
+    entities: list[str] = []
+    for row in rows[:max_entities]:
+        if not isinstance(row, (list, tuple)):
+            continue
+        parts: list[str] = []
+        for index, column in enumerate(columns[:4]):
+            if index >= len(row):
+                continue
+            value = row[index]
+            if value is None or value == "":
+                continue
+            parts.append(f"{column}={value}")
+        if parts:
+            entities.append(", ".join(parts))
+    return entities[:max_entities]
+
+
+def normalize_identifier(value: str) -> str:
+    normalized = value.strip().lower()
+    for suffix in ("_id", "_key", "_code"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
+
+
+def normalize_entity_name(value: str) -> str:
+    normalized = normalize_identifier(value)
+    if normalized.endswith("ies") and len(normalized) > 3:
+        return f"{normalized[:-3]}y"
+    if normalized.endswith("s") and not normalized.endswith("ss") and len(normalized) > 1:
+        return normalized[:-1]
+    return normalized
+
+
+def _column_names_from_structure(structure: object) -> list[str]:
+    return [str(getattr(column, "name", "")).strip() for column in getattr(structure, "columns", ()) if str(getattr(column, "name", "")).strip()]
+
+
+def detect_candidate_key_columns(columns: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for column in columns:
+        normalized = column.lower()
+        if normalized == "id" or normalized.endswith("_id") or normalized.endswith("_key") or normalized in {"key", "code", "ssn"}:
+            candidates.append(column)
+    return candidates
+
+
+def detect_datetime_like_columns(columns: list[str], raw_types: dict[str, str] | None = None) -> list[str]:
+    raw_types = raw_types or {}
+    matches: list[str] = []
+    for column in columns:
+        normalized = column.lower()
+        raw_type = raw_types.get(column, "").lower()
+        if any(token in normalized for token in ("date", "time", "timestamp", "created_at", "updated_at")) or any(
+            token in raw_type for token in ("date", "time")
+        ):
+            matches.append(column)
+    return matches
+
+
+def detect_numeric_columns(columns: list[str], raw_types: dict[str, str] | None = None, analysis: object | None = None) -> list[str]:
+    raw_types = raw_types or {}
+    matches: list[str] = []
+    analysis_columns = getattr(analysis, "columns", {}) if analysis is not None else {}
+    for column in columns:
+        raw_type = raw_types.get(column, "").lower()
+        metrics = getattr(analysis_columns.get(column), "layer1_metrics", {}) if isinstance(analysis_columns, dict) else {}
+        numeric_ratio = float(metrics.get("numeric_ratio", 0.0)) if isinstance(metrics, dict) and metrics.get("numeric_ratio") is not None else 0.0
+        if any(token in raw_type for token in ("int", "real", "float", "double", "numeric", "decimal")) or numeric_ratio >= 0.8:
+            matches.append(column)
+    return matches
+
+
+def detect_text_columns(columns: list[str], raw_types: dict[str, str] | None = None, analysis: object | None = None) -> list[str]:
+    raw_types = raw_types or {}
+    matches: list[str] = []
+    analysis_columns = getattr(analysis, "columns", {}) if analysis is not None else {}
+    for column in columns:
+        raw_type = raw_types.get(column, "").lower()
+        metrics = getattr(analysis_columns.get(column), "layer1_metrics", {}) if isinstance(analysis_columns, dict) else {}
+        avg_length = float(metrics.get("average_length", 0.0)) if isinstance(metrics, dict) and metrics.get("average_length") is not None else 0.0
+        alpha_ratio = float(metrics.get("alpha_ratio", 0.0)) if isinstance(metrics, dict) and metrics.get("alpha_ratio") is not None else 0.0
+        if any(token in raw_type for token in ("char", "text", "clob", "string")) or (avg_length >= 8 and alpha_ratio >= 0.3):
+            matches.append(column)
+    return matches
+
+
+def detect_categorical_columns(columns: list[str], raw_types: dict[str, str] | None = None, analysis: object | None = None) -> list[str]:
+    raw_types = raw_types or {}
+    matches: list[str] = []
+    analysis_columns = getattr(analysis, "columns", {}) if analysis is not None else {}
+    for column in columns:
+        if column in detect_candidate_key_columns(columns):
+            continue
+        raw_type = raw_types.get(column, "").lower()
+        metrics = getattr(analysis_columns.get(column), "layer1_metrics", {}) if isinstance(analysis_columns, dict) else {}
+        unique_ratio = float(metrics.get("unique_ratio", 1.0)) if isinstance(metrics, dict) and metrics.get("unique_ratio") is not None else 1.0
+        if any(token in raw_type for token in ("char", "text", "string")) and unique_ratio <= 0.5:
+            matches.append(column)
+            continue
+        normalized = column.lower()
+        if normalized.endswith("_type") or normalized.endswith("_status") or normalized.endswith("_category") or normalized.endswith("_group"):
+            matches.append(column)
+    return matches
+
+
+def classify_columns_from_structure(structure: object, analysis: object | None = None) -> dict[str, list[str]]:
+    columns = _column_names_from_structure(structure)
+    raw_types = {
+        str(getattr(column, "name", "")).strip(): str(getattr(column, "raw_type", "") or "")
+        for column in getattr(structure, "columns", ())
+        if str(getattr(column, "name", "")).strip()
+    }
+    candidate_keys = detect_candidate_key_columns(columns)
+    datetime_like = detect_datetime_like_columns(columns, raw_types=raw_types)
+    numeric = detect_numeric_columns(columns, raw_types=raw_types, analysis=analysis)
+    text = [column for column in detect_text_columns(columns, raw_types=raw_types, analysis=analysis) if column not in datetime_like]
+    categorical = [column for column in detect_categorical_columns(columns, raw_types=raw_types, analysis=analysis) if column not in numeric and column not in datetime_like]
+    return {
+        "columns": columns,
+        "candidate_key_columns": candidate_keys,
+        "categorical_columns": categorical,
+        "numeric_columns": numeric,
+        "text_columns": text,
+        "datetime_like_columns": datetime_like,
+    }
+
+
+def build_operational_summary_for_unit(
+    *,
+    unit_name: str,
+    structure: object,
+    analysis: object | None,
+    cache_key: str,
+    action: str,
+    depth: str | None = None,
+) -> dict[str, object]:
+    classified = classify_columns_from_structure(structure, analysis=analysis)
+    row_count = None
+    if analysis is not None:
+        standardized = getattr(analysis, "standardized", None)
+        row_count = getattr(standardized, "row_count", None)
+    notes: list[str] = []
+    if classified["candidate_key_columns"]:
+        notes.append("colunas candidatas a chave detectadas")
+    if classified["datetime_like_columns"]:
+        notes.append("colunas temporais detectadas")
+    return {
+        "action": action,
+        "status": "cached",
+        "unit_name": unit_name,
+        "depth": depth,
+        "cache_key": cache_key,
+        "operational_summary": {
+            "row_count": row_count,
+            "columns": classified["columns"],
+            "metrics_available": analysis is not None,
+            "notes": notes,
+        },
+        "evidence": {
+            "columns": classified["columns"],
+            "row_count": row_count,
+            "candidate_key_columns": classified["candidate_key_columns"],
+            "categorical_columns": classified["categorical_columns"],
+            "numeric_columns": classified["numeric_columns"],
+            "text_columns": classified["text_columns"],
+            "datetime_like_columns": classified["datetime_like_columns"],
+        },
+        "next_requirements": [],
+    }
+
+
+def build_operational_summary_for_query(
+    *,
+    action: str,
+    cache_key: str,
+    units: list[str],
+    columns: list[str],
+    rows: list[tuple[object, ...]],
+    row_count_preview: int,
+    truncated: bool,
+    query_id: str | None = None,
+) -> dict[str, object]:
+    evidence = {
+        "columns": columns,
+        "row_count": row_count_preview,
+        "candidate_key_columns": detect_candidate_key_columns(columns),
+        "categorical_columns": [],
+        "numeric_columns": detect_numeric_columns(columns),
+        "text_columns": detect_text_columns(columns),
+        "datetime_like_columns": detect_datetime_like_columns(columns),
+    }
+    notes = ["preview de consulta SELECT validada"]
+    if truncated:
+        notes.append("resultado parcial na prévia")
+    payload: dict[str, object] = {
+        "action": action,
+        "status": "cached",
+        "cache_key": cache_key,
+        "units": units,
+        "columns": columns,
+        "row_count_preview": row_count_preview,
+        "truncated": truncated,
+        "operational_summary": {
+            "row_count": row_count_preview,
+            "columns": columns,
+            "metrics_available": False,
+            "notes": notes,
+        },
+        "evidence": evidence,
+        "sample_entities": extract_sample_entities(columns, rows, max_entities=10),
+        "next_requirements": [],
+    }
+    if query_id:
+        payload["query_id"] = query_id
+        # Only offer a recall requirement when the preview was truncated; otherwise
+        # prefer generating exploratory next requirements (e.g., categorical children).
+        if truncated:
+            payload["next_requirements"] = [
+                {
+                    "id": f"req_recall_query_{query_id}",
+                    "kind": "recall",
+                    "units": units,
+                    "description": f"Recuperar detalhes da consulta {query_id}",
+                    "reason": "resultado já calculado e cacheado",
+                    "suggested_action": {"action": "recall", "key": cache_key},
+                    "status": "pending",
+                    "source_node_id": "",
+                }
+            ]
+        else:
+            payload["next_requirements"] = []
+    return payload
+
+
 def validate_select_sql_text(sql: str) -> str:
     normalized = " ".join(sql.strip().split())
     upper = normalized.upper()
@@ -1446,26 +3270,44 @@ def main(argv: list[str] | None = None) -> int:
         session.history.append({"role": "user", "content": user_text})
         last_error: str | None = None
         last_result: str | None = None
-        executed_queries: list[str] = []
+        executed_queries: list[object] = []
         handled = False
 
         for attempt_number in range(1, MAX_ATTEMPTS_PER_TURN + 1):
             try:
-                action_payload = session.orchestrate(
+                cache_keys_before = set(session.available_cache_keys())
+                action_payload = plan_deterministic_action(
+                    session,
                     user_text,
-                    structural_context,
-                    last_error=last_error,
                     last_result=last_result,
-                    executed_queries=executed_queries,
-                    attempt_number=attempt_number,
+                    last_error=last_error,
                 )
+                if action_payload is None:
+                    action_payload = session.orchestrate(
+                        user_text,
+                        structural_context,
+                        last_error=last_error,
+                        last_result=last_result,
+                        executed_queries=executed_queries,
+                        attempt_number=attempt_number,
+                    )
                 execution_result = session.execute_action(action_payload)
+                cache_keys_after = set(session.available_cache_keys())
+                logger.debug(
+                    "planner_action=%s executed=%s new_cache_keys=%s",
+                    action_payload,
+                    True,
+                    sorted(cache_keys_after - cache_keys_before),
+                )
                 last_error = None
                 last_result = execution_result
                 if action_payload["action"] == "query":
                     query_id = str(action_payload.get("query_id", "")).strip()
-                    if query_id and query_id not in executed_queries:
-                        executed_queries.append(query_id)
+                    if query_id:
+                        executed_queries.append({"query_id": query_id, "sql": ""})
+                if action_payload["action"] == "request_new_query":
+                    payload = json.loads(execution_result)
+                    executed_queries.append({"query_id": str(payload.get("query_id", "")), "sql": str(payload.get("sql", ""))})
                 if action_payload["action"] == "done":
                     final_text = session.interface_reply(
                         "Apresente a conclusão final ao usuário com base no texto da orquestradora.",

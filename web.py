@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -18,6 +19,7 @@ from orchestrator import (
     MAX_ATTEMPTS_PER_TURN,
     OrchestratorSession,
     compress_assistant_message,
+    plan_deterministic_action,
     print_session_query_candidates,
     render_schema_message,
     render_tables_message,
@@ -136,26 +138,44 @@ def _run_turn(state: SessionState, user_text: str) -> str:
     session.history.append({"role": "user", "content": user_text})
     last_error: str | None = None
     last_result: str | None = None
-    executed_queries: list[str] = []
+    executed_queries: list[object] = []
 
     for attempt_number in range(1, MAX_ATTEMPTS_PER_TURN + 1):
         try:
-            action_payload = session.orchestrate(
+            cache_keys_before = set(session.available_cache_keys())
+            action_payload = plan_deterministic_action(
+                session,
                 user_text,
-                state.structural_context,
-                last_error=last_error,
                 last_result=last_result,
-                executed_queries=executed_queries,
-                query_catalog=sorted(session.catalog_for_session().keys()),
-                attempt_number=attempt_number,
+                last_error=last_error,
             )
+            if action_payload is None:
+                action_payload = session.orchestrate(
+                    user_text,
+                    state.structural_context,
+                    last_error=last_error,
+                    last_result=last_result,
+                    executed_queries=executed_queries,
+                    query_catalog=sorted(session.catalog_for_session().keys()),
+                    attempt_number=attempt_number,
+                )
             execution_result = session.execute_action(action_payload)
+            cache_keys_after = set(session.available_cache_keys())
+            logger.debug(
+                "planner_action=%s executed=%s new_cache_keys=%s",
+                action_payload,
+                True,
+                sorted(cache_keys_after - cache_keys_before),
+            )
             last_error = None
             last_result = execution_result
             if action_payload["action"] == "query":
                 query_id = str(action_payload.get("query_id", "")).strip()
-                if query_id and query_id not in executed_queries:
-                    executed_queries.append(query_id)
+                if query_id:
+                    executed_queries.append({"query_id": query_id, "sql": ""})
+            if action_payload["action"] == "request_new_query":
+                payload = json.loads(execution_result)
+                executed_queries.append({"query_id": str(payload.get("query_id", "")), "sql": str(payload.get("sql", ""))})
 
             if action_payload["action"] == "done":
                 final_text = session.interface_reply(
