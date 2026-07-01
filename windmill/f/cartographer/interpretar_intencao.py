@@ -45,10 +45,25 @@ STRIP_KEYWORDS = {
 }
 
 CONFIRMATION_WORDS = frozenset(
-    {"sim", "si", "ok", "confirme", "pode", "prossiga", "continue", "vai", "execute"}
+    {
+        "sim",
+        "si",
+        "ok",
+        "okay",
+        "confirme",
+        "confirma",
+        "pode",
+        "prossiga",
+        "continue",
+        "vai",
+        "execute",
+        "beleza",
+        "claro",
+    }
 )
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE)
+_NUMBERED_LIST_ITEM_RE = re.compile(r"^\s*(\d+)\.\s*(.+?)\s*$", re.MULTILINE)
 
 INTENT_RESOLVER_SYSTEM_PROMPT = """Você interpreta mensagens do usuário sobre unidades de dados (tabelas).
 
@@ -412,8 +427,62 @@ def _get_api_key() -> str | None:
     return api_key or None
 
 
+def _strip_trailing_punctuation(text: str) -> str:
+    return re.sub(r"[.!?]+$", "", text).strip()
+
+
 def _is_short_confirmation(message: str) -> bool:
-    return _normalize(message) in CONFIRMATION_WORDS
+    normalized = _strip_trailing_punctuation(_normalize(message))
+    return normalized in CONFIRMATION_WORDS
+
+
+def _parse_numeric_selection(message: str) -> int | None:
+    normalized = _strip_trailing_punctuation(_normalize(message))
+    if re.fullmatch(r"\d+", normalized):
+        return int(normalized)
+    return None
+
+
+def _parse_numbered_list(text: str) -> dict[int, str]:
+    items: dict[int, str] = {}
+    for match in _NUMBERED_LIST_ITEM_RE.finditer(text):
+        items[int(match.group(1))] = match.group(2).strip()
+    return items
+
+
+def _last_assistant_message(history: list | None) -> str | None:
+    if not isinstance(history, list):
+        return None
+    for entry in reversed(history):
+        if isinstance(entry, dict) and entry.get("role") == "assistant":
+            content = entry.get("content")
+            if content is not None:
+                return str(content)
+    return None
+
+
+def _resolve_numeric_list_selection(
+    message: str,
+    units: list[str],
+    history: list | None,
+) -> dict | None:
+    index = _parse_numeric_selection(message)
+    if index is None:
+        return None
+
+    assistant_message = _last_assistant_message(history)
+    if not assistant_message:
+        return None
+
+    numbered_list = _parse_numbered_list(assistant_message)
+    if index not in numbered_list:
+        return None
+
+    unit_name = _canonical_unit_name(numbered_list[index], units)
+    if unit_name is None:
+        return None
+
+    return {"action": "analyze_unit", "unit_name": unit_name}
 
 
 def _normalize_pending_action(pending_action: dict | None, units: list[str]) -> dict | None:
@@ -539,6 +608,11 @@ def main(
             "unit_name": unit_name,
             "session_id": session_id,
         }
+
+    numeric_result = _resolve_numeric_list_selection(message, units, conversation_history)
+    if numeric_result is not None:
+        numeric_result["session_id"] = session_id
+        return numeric_result
 
     if api_key:
         llm_result = _llm_interpret_intent(

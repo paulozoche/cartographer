@@ -224,3 +224,109 @@ def test_confirmation_ignores_last_action_without_pending(intent_module, monkeyp
         "response": "Não há ação pendente.",
         "session_id": "sess-1",
     }
+
+
+SQL_MURDER_UNITS = [
+    "crime_scene_report",
+    "drivers_license",
+    "person",
+    "interview",
+    "get_fit_now_member",
+    "gym",
+    "facebook_event_checkin",
+    "income",
+    "solution",
+]
+
+SQL_MURDER_LIST_HISTORY = [
+    {
+        "role": "assistant",
+        "content": (
+            "1. crime_scene_report\n"
+            "2. drivers_license\n"
+            "3. person\n"
+            "4. interview\n"
+            "5. get_fit_now_member\n"
+            "6. gym\n"
+            "7. facebook_event_checkin\n"
+            "8. income\n"
+            "9. solution"
+        ),
+    }
+]
+
+
+def test_numeric_selection_from_numbered_list(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: SQL_MURDER_UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+
+    result = intent_module.main("2", "sess-1", history=SQL_MURDER_LIST_HISTORY)
+
+    assert result == {
+        "action": "analyze_unit",
+        "unit_name": "drivers_license",
+        "session_id": "sess-1",
+    }
+
+
+def test_numeric_selection_with_trailing_punctuation(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: SQL_MURDER_UNITS)
+
+    result = intent_module.main("2.", "sess-1", history=SQL_MURDER_LIST_HISTORY)
+
+    assert result == {
+        "action": "analyze_unit",
+        "unit_name": "drivers_license",
+        "session_id": "sess-1",
+    }
+
+
+def test_invalid_numeric_selection_falls_back_to_llm(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: SQL_MURDER_UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+
+    llm_called = False
+
+    def fake_llm(*_args, **_kwargs):
+        nonlocal llm_called
+        llm_called = True
+        return {
+            "action": "pending",
+            "suggested_action": None,
+            "suggestion": "Qual unidade deseja analisar?",
+            "response": "Qual unidade deseja analisar?",
+        }
+
+    monkeypatch.setattr(intent_module, "_llm_interpret_intent", fake_llm)
+
+    result = intent_module.main("99", "sess-1", history=SQL_MURDER_LIST_HISTORY)
+
+    assert llm_called is True
+    assert result["action"] == "pending"
+    assert result["session_id"] == "sess-1"
+
+
+@pytest.mark.parametrize(
+    ("message", "pending"),
+    [
+        ("confirma.", {"action": "analyze_unit", "unit_name": "person"}),
+        ("okay!", {"action": "analyze_unit", "unit_name": "person"}),
+        ("beleza?", {"action": "analyze_unit", "unit_name": "person"}),
+        ("claro.", {"action": "analyze_unit", "unit_name": "person"}),
+    ],
+)
+def test_confirmation_with_punctuation_and_variants(
+    intent_module,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    pending: dict,
+) -> None:
+    monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+
+    result = intent_module.main(message, "sess-1", pending_action=pending)
+
+    assert result == {
+        "action": "analyze_unit",
+        "unit_name": "person",
+        "session_id": "sess-1",
+    }
