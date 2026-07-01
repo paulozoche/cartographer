@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agnostic.domain.metrics.average_length import average_length
 from agnostic.domain.metrics.cardinality import cardinality
+from agnostic.domain.metrics.completeness_ratio import completeness_ratio
 from agnostic.domain.metrics.empty_string_ratio import empty_string_ratio
 from agnostic.domain.metrics.frequency import frequency
 from agnostic.domain.metrics.length_range import length_range
@@ -21,4 +22,5 @@ LAYER1_METRICS = {
     "length_range": length_range,
     "length_variance": length_variance,
     "empty_string_ratio": empty_string_ratio,
+    "completeness_ratio": completeness_ratio,
 }

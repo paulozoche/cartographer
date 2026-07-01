@@ -23,7 +23,10 @@ DEFAULT_RAW_PAYLOAD_PREVIEW_MAX_BYTES = 200_000
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8000
 DEFAULT_SERVER_ACCESS_LOG = False
-DEFAULT_ANALYSIS_MAX_ROWS_PER_UNIT = 100_000
+# Calibrado para hardware comum com ~20GB de RAM processando datasets
+# via pandas/SQLite: 5 milhões de linhas cabem em memória com folga nesse
+# perfil sem exigir streaming/particionamento adicional.
+DEFAULT_ANALYSIS_MAX_ROWS_PER_UNIT = 5_000_000
 DEFAULT_ANALYSIS_MAX_UNITS_PER_SOURCE = 5
 
 # Proteções de runtime

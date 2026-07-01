@@ -4,6 +4,7 @@ import hashlib
 import os
 import sqlite3
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 from agnostic.domain.models.tabular import (
     ColumnStructure,
@@ -18,12 +19,36 @@ class SQLiteDataSource:
     connector_name = "sqlite3"
     connector_version = sqlite3.sqlite_version
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, connection: sqlite3.Connection | None = None):
         self._db_path = db_path
+        self._connection = connection
+
+    @classmethod
+    def from_connection(
+        cls,
+        connection: sqlite3.Connection,
+        source_identifier: str,
+    ) -> SQLiteDataSource:
+        return cls(source_identifier, connection=connection)
+
+    def execution_target(self) -> str | sqlite3.Connection:
+        if self._connection is not None:
+            return self._connection
+        return self._db_path
 
     @property
     def display_name(self) -> str:
         return os.path.basename(self._db_path) or self._db_path
+
+    @contextmanager
+    def connection(self):
+        if self._connection is not None:
+            self._configure_connection(self._connection)
+            yield self._connection
+            return
+        with sqlite3.connect(self._db_path) as conn:
+            self._configure_connection(conn)
+            yield conn
 
     def get_metadata(self) -> SourceMetadata:
         return SourceMetadata(
@@ -37,13 +62,15 @@ class SQLiteDataSource:
         )
 
     def list_units(self) -> list["SQLiteTabularUnit"]:
-        with sqlite3.connect(self._db_path) as connection:
-            self._configure_connection(connection)
+        with self.connection() as connection:
             cursor = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
             )
             tables = [str(row[0]) for row in cursor.fetchall()]
-        return [SQLiteTabularUnit(self._db_path, table_name) for table_name in tables]
+        return [
+            SQLiteTabularUnit(self._db_path, table_name, connection=self._connection)
+            for table_name in tables
+        ]
 
     def _fingerprint(self) -> str:
         digest = hashlib.sha256()
@@ -60,13 +87,30 @@ class SQLiteDataSource:
 
 
 class SQLiteTabularUnit:
-    def __init__(self, db_path: str, unit_name: str):
+    def __init__(
+        self,
+        db_path: str,
+        unit_name: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ):
         self._db_path = db_path
         self._unit_name = unit_name
+        self._shared_connection = connection
 
     @property
     def unit_name(self) -> str:
         return self._unit_name
+
+    @contextmanager
+    def _open_connection(self):
+        if self._shared_connection is not None:
+            SQLiteDataSource._configure_connection(self._shared_connection)
+            yield self._shared_connection
+            return
+        with sqlite3.connect(self._db_path) as conn:
+            SQLiteDataSource._configure_connection(conn)
+            yield conn
 
     def get_metadata(self) -> UnitMetadata:
         return UnitMetadata(
@@ -76,8 +120,7 @@ class SQLiteTabularUnit:
         )
 
     def get_structure(self) -> UnitStructure:
-        with sqlite3.connect(self._db_path) as connection:
-            SQLiteDataSource._configure_connection(connection)
+        with self._open_connection() as connection:
             cursor = connection.execute(f'PRAGMA table_info("{self._unit_name}")')
             columns = tuple(
                 ColumnStructure(
@@ -100,8 +143,7 @@ class SQLiteTabularUnit:
         )
 
     def get_rows(self) -> Iterator[tuple[object, ...]]:
-        with sqlite3.connect(self._db_path) as connection:
-            SQLiteDataSource._configure_connection(connection)
+        with self._open_connection() as connection:
             cursor = connection.execute(f'SELECT * FROM "{self._unit_name}"')
             for row in cursor:
                 yield tuple(row)

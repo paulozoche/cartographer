@@ -37,19 +37,22 @@ Transformar resultados estruturais em texto humano, resumo ou Markdown.
 
 ## Public Surface Summary
 
-Superfície pública esperada, sujeita a formalização detalhada em `CONTRACT.md`:
+Símbolos públicos exportados por `agnostic.presentation.markdown`:
 
-- funções públicas de sumarização textual;
-- funções públicas de rendering Markdown;
-- tipos públicos necessários para representar saídas textuais observáveis.
+| Símbolo | Uso |
+|---------|-----|
+| `render_knowledge_map` | Mapa indentado para humanos (comando `mapa`, CLI, sidebar) |
+| `render_knowledge_graph_context` | Contexto textual do grafo para Curadora/IA |
+| `build_knowledge_map_context` | Monta `dict` de contexto a partir da sessão |
+| `render_followup_options_message` | Lista numerada de opções pós-resultado |
+| `render_canonical_analysis_markdown` | Markdown de análise canônica |
 
-Os símbolos públicos exatos ainda dependem de formalização detalhada.
+Helpers internos (não contrato): `_append_knowledge_lines`, `_node_as_dict` em `render_knowledge_graph.py`.
 
 `NEEDS_DOCUMENTATION_DECISION`
 
-- lista normativa final de símbolos públicos do módulo;
 - distinção final entre transformação textual pública e helper interno de formatação;
-- formatos públicos estáveis de saída textual e Markdown.
+- política de versionamento dos formatos Markdown observáveis (`## Mapa do Conhecimento`, `## Grafo de Conhecimento`).
 
 ## Main Producers
 
@@ -58,16 +61,21 @@ Os símbolos públicos exatos ainda dependem de formalização detalhada.
 
 ## Main Consumers
 
-Consumidores atuais ou previstos pela documentação ativa:
+Consumidores atuais:
 
-- `application`
-- `interfaces`
+- `orchestrator.py` — mapa, contexto do grafo, follow-up options, summaries
+- `web.py` — comando `mapa` via `render_knowledge_map`
+
+Consumidores previstos:
+
+- `interfaces` (quando `src/agnostic/interfaces/api/` substituir `web.py`)
 
 Consumidores devem usar contratos públicos do módulo, não detalhes internos de formatação.
 
 ## Allowed Dependencies
 
-- `domain`, para consumir resultados estruturais por contrato público;
+- `domain`, para consumir resultados estruturais por contrato público (ex.: `KnowledgeGraph` como tipo de entrada);
+- `application/planning`, para ordenação e filtragem de requisitos na renderização do mapa (`requirement_schema`, `requirement_priority`, `focus_state`);
 - dependências internas do próprio módulo `presentation`;
 - outras superfícies públicas explicitamente formalizadas necessárias à composição textual.
 
