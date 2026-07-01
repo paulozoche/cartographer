@@ -1,4 +1,4 @@
-.PHONY: web core-api windmill-deploy
+.PHONY: web core-api windmill-deploy up down
 
 # Prefer project venv; fall back to python3 on PATH.
 PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
@@ -15,3 +15,19 @@ core-api:
 # Deploy workflow Cartographer Chat no Windmill (requer WINDMILL_TOKEN ou WINDMILL_PASSWORD)
 windmill-deploy:
 	$(PYTHON) scripts/deploy_cartographer_windmill.py
+
+# Sobe Windmill (Docker), Core API e Web em background
+up:
+	@echo "Subindo Windmill, Core API e Web..."
+	docker start windmill || docker compose up -d windmill
+	@(make core-api > /tmp/cartographer_core.log 2>&1 &)
+	@(make web > /tmp/cartographer_web.log 2>&1 &)
+	@sleep 2
+	@echo "Core API → :8000  (log: /tmp/cartographer_core.log)"
+	@echo "Web       → :8080  (log: /tmp/cartographer_web.log)"
+	@echo "Windmill  → :8002"
+
+# Para Core API e Web (portas 8000 e 8080)
+down:
+	@fuser -k 8000/tcp 8080/tcp 2>/dev/null || true
+	@echo "Core API e Web parados."
