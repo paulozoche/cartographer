@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,9 +29,12 @@ from agnostic.domain.models.tabular import (
     UnitMetadata,
     UnitStructure,
 )
+from agnostic.domain.normalization.structural_pattern import StructuralPattern, detect_structural_pattern
 
 if TYPE_CHECKING:
     from agnostic.application.ports.tabular_source import TabularUnit
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,7 @@ class ColumnAnalysis:
     layer1_metrics: dict[str, object]
     layer2_metrics: dict[str, float]
     heuristics: tuple[HeuristicResult, ...]
+    structural_pattern: StructuralPattern
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +63,19 @@ class TabularUnitAnalysis:
     suggested_actions: tuple[str, ...]
     metadata: UnitMetadata
     structure: UnitStructure
+    # TECH DEBT: `standardized` retains every column/row of the unit (e.g. 270k
+    # rows for vari_rrlyrae) for the whole lifetime of the cached analysis, even
+    # though the application layer only needs already-computed aggregations
+    # (numeric_stats, capped top_values, correlations, composite-key/mixed-format
+    # candidates, structural patterns, sample previews). Ideally the Core would
+    # compute these aggregations eagerly here and attach only the aggregated
+    # surface to the returned object, dropping the raw columns so they are not
+    # held in memory for subsequent application passes. This is intentionally NOT
+    # done yet: `standardized.columns` is read in 17+ places across the
+    # orchestrator and presentation layers, so removing it is a broad,
+    # behaviour-sensitive refactor that must preserve the deterministic/agnostic
+    # Core contract. Tracked as future work; see items 1 & 2 (top_values cap and
+    # single-pass correlations) for the redundant-work fixes already applied.
     standardized: StandardizedTabularUnit
     columns: dict[str, ColumnAnalysis]
     ranked_units: tuple[dict[str, object], ...]
@@ -69,15 +88,28 @@ def analyze_tabular_unit(
 ) -> TabularUnitAnalysis:
     metadata = unit.get_metadata()
     structure = unit.get_structure()
+    logger.info(
+        "Iniciando análise da unidade %s (%s linhas)...",
+        unit.unit_name,
+        metadata.row_count if metadata.row_count is not None else "?",
+    )
+
+    _t = time.perf_counter()
     standardized = standardize_tabular_unit(
         unit_name=unit.unit_name,
         structure=structure,
         rows=unit.get_rows(),
         max_rows=max_rows,
     )
+    logger.info("Leitura dos dados concluída em %.2fs", time.perf_counter() - _t)
 
+    _t = time.perf_counter()
     layer1_metrics = apply_layer1_metrics(standardized)
+    logger.info("Cálculo de layer1_metrics concluído em %.2fs", time.perf_counter() - _t)
+
+    _t = time.perf_counter()
     layer2_metrics = apply_layer2_metrics(standardized)
+    logger.info("Cálculo de layer2_metrics concluído em %.2fs", time.perf_counter() - _t)
 
     raw_columns: dict[str, ColumnAnalysis] = {}
     for column_name in standardized.column_order:
@@ -86,6 +118,7 @@ def analyze_tabular_unit(
             **layer2_metrics[column_name],
         }
         heuristics = tuple(apply_column_heuristics(combined_metrics))
+        structural_pattern = detect_structural_pattern(standardized.columns[column_name])
         signatures = infer_signatures_from_metrics(
             heuristics=list(heuristics),
             column_metrics=combined_metrics,
@@ -102,6 +135,7 @@ def analyze_tabular_unit(
             layer1_metrics=layer1_metrics[column_name],
             layer2_metrics=layer2_metrics[column_name],
             heuristics=heuristics,
+            structural_pattern=structural_pattern,
         )
 
     ordered_columns = sorted(

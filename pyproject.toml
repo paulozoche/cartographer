@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agnostic"
+version = "0.1.0"
+description = "Agnostic Data Analyser core library"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "chardet>=5.2.0",
+    "pandas>=3.0.0",
+    "pyarrow>=23.0.0",
+    "python-dateutil>=2.9.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

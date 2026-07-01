@@ -81,6 +81,8 @@
         padding: 16px 20px;
         border-radius: 18px;
         backdrop-filter: blur(6px);
+        position: relative;
+        z-index: 3;
       }
 
       .brand {
@@ -225,6 +227,19 @@
         background: rgba(255, 248, 220, 0.02);
       }
 
+      .table-chip.clickable {
+        cursor: pointer;
+        transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+      }
+
+      .table-chip.clickable:hover,
+      .table-chip.clickable:focus-visible {
+        transform: translateY(-1px);
+        border-color: rgba(212, 168, 67, 0.72);
+        background: rgba(212, 168, 67, 0.08);
+        outline: none;
+      }
+
       .table-chip strong {
         display: block;
         color: var(--text);
@@ -259,6 +274,7 @@
           radial-gradient(circle at bottom right, rgba(212, 168, 67, 0.06), transparent 24%),
           linear-gradient(180deg, rgba(36, 29, 20, 0.98), rgba(27, 22, 16, 0.98));
         position: relative;
+        isolation: isolate;
       }
 
       .chat-header {
@@ -268,6 +284,8 @@
         gap: 18px;
         padding: 18px 22px;
         border-bottom: 1px solid var(--border);
+        position: relative;
+        z-index: 1;
       }
 
       .chat-header-copy h2 {
@@ -333,6 +351,8 @@
         display: flex;
         flex-direction: column;
         gap: 18px;
+        position: relative;
+        z-index: 1;
       }
 
       .message {
@@ -427,9 +447,105 @@
         border: 1px solid rgba(212, 168, 67, 0.12);
       }
 
+      .message-body hr {
+        border: 0;
+        border-top: 1px solid rgba(212, 168, 67, 0.18);
+        margin: 18px 0;
+      }
+
+      .message-body table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 14px 0;
+        font-size: 14px;
+        border: 1px solid rgba(212, 168, 67, 0.18);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+
+      .message-body thead th {
+        background: rgba(255, 248, 220, 0.08);
+        color: var(--gold);
+        font-weight: 700;
+      }
+
+      .message-body th,
+      .message-body td {
+        padding: 10px 12px;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid rgba(212, 168, 67, 0.12);
+      }
+
+      .message-body tbody tr:nth-child(even) {
+        background: rgba(255, 248, 220, 0.03);
+      }
+
+      .message-body tbody tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .message-body .interface-warning {
+        margin: 12px 0;
+        padding: 10px 12px;
+        border-left: 4px solid #d4a843;
+        border-radius: 10px;
+        background: rgba(212, 168, 67, 0.12);
+        color: #e0c981;
+        font-size: 0.94em;
+      }
+
+      .message-body .interface-hypothesis {
+        margin: 14px 0;
+        padding: 12px 14px;
+        border-left: 4px solid #5d8fd6;
+        border-radius: 10px;
+        background: rgba(93, 143, 214, 0.12);
+        color: #c7d8f3;
+      }
+
+      .message-body .interface-hypothesis strong {
+        color: #d6e4fb;
+      }
+
+      .message-body .interface-reason {
+        display: block;
+        margin-top: 4px;
+        margin-left: 18px;
+        color: var(--text-dim);
+        font-size: 0.9em;
+      }
+
+      .assist-options {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .assist-option-button {
+        border: 1px solid var(--border-strong);
+        color: var(--gold);
+        background: linear-gradient(180deg, rgba(47, 37, 24, 0.98), rgba(31, 25, 17, 0.98));
+        border-radius: 999px;
+        padding: 8px 14px;
+        cursor: pointer;
+        transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+      }
+
+      .assist-option-button:hover,
+      .assist-option-button:focus-visible {
+        transform: translateY(-1px);
+        border-color: rgba(212, 168, 67, 0.72);
+        background: rgba(212, 168, 67, 0.08);
+        outline: none;
+      }
+
       .composer {
         padding: 18px 22px 22px;
         border-top: 1px solid var(--border);
+        position: relative;
+        z-index: 2;
       }
 
       .composer-form {
@@ -483,12 +599,14 @@
 
       .compass-decor {
         position: absolute;
-        right: 20px;
-        bottom: 94px;
-        width: 116px;
-        height: 116px;
+        top: 18px;
+        right: 18px;
+        width: 72px;
+        height: 72px;
         color: rgba(212, 168, 67, 0.18);
         pointer-events: none;
+        z-index: 0;
+        opacity: 0.72;
       }
 
       .compass-decor svg,
@@ -576,10 +694,10 @@
         }
 
         .compass-decor {
-          width: 86px;
-          height: 86px;
+          top: 14px;
           right: 14px;
-          bottom: 112px;
+          width: 56px;
+          height: 56px;
         }
       }
     </style>
@@ -600,7 +718,7 @@
           </div>
           <div class="brand-copy">
             <h1>CARTOGRAPHER</h1>
-            <p>Exploração conversacional com mapa de conhecimento.</p>
+            <p>Cartographer — exploração tabular assistida por IA. Envie um arquivo e explore seus dados em linguagem natural.</p>
           </div>
         </div>
         <div class="topbar-actions">
@@ -727,12 +845,95 @@
       const pendingCount = document.getElementById("pendingCount");
 
       let sessionId = "";
+      let sessionUnits = [];
+      let lastResult = null;
       let lastUserMessage = "";
       let mapState = {
         explored: [],
         pending: [],
         nodeCount: 0,
       };
+
+      function escapeHtml(text) {
+        const map = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;",
+        };
+        return String(text || "").replace(/[&<>"']/g, (char) => map[char]);
+      }
+
+      function renderMarkdown(text) {
+        const rawText = String(text || "");
+        const normalizedText = rawText
+          .split("\n")
+          .reduce((lines, currentLine) => {
+            const previousLine = lines.length ? lines[lines.length - 1] : "";
+            const previousNonEmptyLine = [...lines].reverse().find((line) => line.trim()) || "";
+            if (
+              /^Minha sugestão\b/.test(currentLine.trim()) &&
+              /^\d+\.\s+\S+/.test(previousNonEmptyLine.trim()) &&
+              previousLine.trim() !== ""
+            ) {
+              lines.push("");
+            }
+            lines.push(currentLine);
+            return lines;
+          }, [])
+          .join("\n");
+        const decoratedText = normalizedText
+          .replace(/^⚠\s+(.+)$/gm, '<div class="interface-warning">⚠ $1</div>')
+          .replace(/^Hipótese:\s+(.+)$/gm, '<div class="interface-hypothesis"><strong>Hipótese:</strong> $1</div>')
+          .replace(/^(\s*→\s+.+)$/gm, '<span class="interface-reason">$1</span>');
+        if (typeof marked === "undefined" || !marked.parse) {
+          const escaped = escapeHtml(decoratedText);
+          return escaped.replace(/\n/g, "<br>");
+        }
+        try {
+          return marked.parse(decoratedText);
+        } catch (err) {
+          const escaped = escapeHtml(decoratedText);
+          return escaped.replace(/\n/g, "<br>");
+        }
+      }
+
+      async function readResponsePayload(response) {
+        try {
+          const text = await response.text();
+          if (!text) return { detail: response.statusText || "Vazio" };
+          try {
+            return JSON.parse(text);
+          } catch {
+            return { detail: text || response.statusText };
+          }
+        } catch {
+          return { detail: response.statusText || "Erro ao ler resposta" };
+        }
+      }
+
+      function copyText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          return navigator.clipboard.writeText(text);
+        }
+        return new Promise((resolve, reject) => {
+          const textarea = document.createElement("textarea");
+          textarea.value = text;
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.appendChild(textarea);
+          try {
+            textarea.select();
+            const success = document.execCommand("copy");
+            document.body.removeChild(textarea);
+            success ? resolve() : reject(new Error("copy falhou"));
+          } catch (err) {
+            document.body.removeChild(textarea);
+            reject(err);
+          }
+        });
+      }
 
       function setBusy(isBusy, statusText) {
         uploadButton.disabled = isBusy;
@@ -749,19 +950,37 @@
         fileName.textContent = file ? file.name : "Nenhum arquivo selecionado";
       }
 
+      function formatUploadSummary(filename, units) {
+        const lines = [
+          `📁 Arquivo: ${filename}`,
+          `📊 Unidades encontradas: ${units.length}`,
+        ];
+        units.forEach((unit, index) => {
+          lines.push(`${index + 1}. ${unit}`);
+        });
+        return lines.join("\n");
+      }
+
       function createCopyButton(text) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "copy-button";
         button.textContent = "Copiar";
         button.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(text);
-          button.textContent = "Copiado";
-          button.classList.add("copied");
-          setTimeout(() => {
-            button.textContent = "Copiar";
-            button.classList.remove("copied");
-          }, 1200);
+          try {
+            await copyText(text);
+            button.textContent = "Copiado";
+            button.classList.add("copied");
+            setTimeout(() => {
+              button.textContent = "Copiar";
+              button.classList.remove("copied");
+            }, 1200);
+          } catch (err) {
+            button.textContent = "Erro ao copiar";
+            setTimeout(() => {
+              button.textContent = "Copiar";
+            }, 1200);
+          }
         });
         return button;
       }
@@ -788,7 +1007,7 @@
         const body = document.createElement("div");
         body.className = "message-body";
         if (role === "bot") {
-          body.innerHTML = marked.parse(text);
+          body.innerHTML = renderMarkdown(text);
         } else {
           body.textContent = text;
         }
@@ -799,6 +1018,126 @@
         chatLog.scrollTop = chatLog.scrollHeight;
 
         maybeUpdateMapState(text);
+      }
+
+      function isDirectAction(message) {
+        const lower = message.toLowerCase();
+        return /\b(analise|analisa|analyze|detalhe|detalhar|cruce|cruze|recall|mapa)\b/.test(lower);
+      }
+
+      function isVagueMessage(message) {
+        const lower = message.toLowerCase();
+        return /\b(quero|encontrar|me ajude|ajuda|help|como|onde|o que|qual|preciso|buscar|procurar|investigar)\b/.test(lower);
+      }
+
+      function shouldUseAssist(message) {
+        return isVagueMessage(message) && !isDirectAction(message);
+      }
+
+      function appendAssistMessage(suggestion, options) {
+        const node = document.createElement("div");
+        node.className = "message bot assist";
+
+        const header = document.createElement("div");
+        header.className = "message-header";
+
+        const label = document.createElement("div");
+        label.className = "message-label";
+        label.textContent = "Assistente";
+
+        const copyTextValue = [suggestion, ...(options || [])].join("\n");
+        const copyButton = createCopyButton(copyTextValue);
+
+        header.appendChild(label);
+        header.appendChild(copyButton);
+
+        const body = document.createElement("div");
+        body.className = "message-body";
+        body.textContent = suggestion;
+
+        if (Array.isArray(options) && options.length) {
+          const optionsWrap = document.createElement("div");
+          optionsWrap.className = "assist-options";
+          options.forEach((option) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "assist-option-button";
+            button.textContent = option;
+            button.addEventListener("click", () => {
+              sendStructuredMessage(`analise ${option}`);
+            });
+            optionsWrap.appendChild(button);
+          });
+          body.appendChild(optionsWrap);
+        }
+
+        node.appendChild(header);
+        node.appendChild(body);
+        chatLog.appendChild(node);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      async function sendAssistMessage(message) {
+        if (!message || !sessionId) return;
+
+        lastUserMessage = message;
+        appendMessage("user", message);
+        setBusy(true, "Consultando assistente");
+
+        try {
+          const response = await fetch("/assist", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              message,
+              context: {
+                units: sessionUnits,
+                last_result: lastResult,
+              },
+            }),
+          });
+          const payload = await readResponsePayload(response);
+          if (!response.ok) {
+            throw new Error(payload.detail || "Falha no assistente.");
+          }
+
+          appendAssistMessage(payload.suggestion, payload.options);
+          setBusy(false, "Sessão ativa");
+          serverStatus.textContent = "Ativo";
+        } catch (error) {
+          appendMessage("system", `Erro no assistente: ${error.message}`);
+          setBusy(false, "Falha no assistente");
+          serverStatus.textContent = "Falha";
+        }
+      }
+
+      async function sendStructuredMessage(message) {
+        if (!message || !sessionId) return;
+
+        lastUserMessage = message;
+        appendMessage("user", message);
+        setBusy(true, "Processando mensagem");
+
+        try {
+          const response = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, message }),
+          });
+          const payload = await readResponsePayload(response);
+          if (!response.ok) {
+            throw new Error(payload.detail || "Falha no chat.");
+          }
+
+          appendMessage("bot", payload.response);
+          setBusy(false, "Sessão ativa");
+          serverStatus.textContent = "Ativo";
+        } catch (error) {
+          appendMessage("system", `Erro no chat: ${error.message}`);
+          setBusy(false, "Falha no chat");
+          serverStatus.textContent = "Falha";
+        }
       }
 
       function renderSidebarList(container, items, kind) {
@@ -817,6 +1156,21 @@
         items.forEach((entry) => {
           const item = document.createElement("li");
           item.className = `table-chip ${kind}`;
+          if (kind === "pending") {
+            item.classList.add("clickable");
+            item.tabIndex = 0;
+            item.setAttribute("role", "button");
+            item.setAttribute("aria-label", `Explorar ${entry.name}`);
+            item.addEventListener("click", () => {
+              sendStructuredMessage(entry.name);
+            });
+            item.addEventListener("keydown", (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                sendStructuredMessage(entry.name);
+              }
+            });
+          }
           const title = document.createElement("strong");
           title.textContent = entry.name;
           const detail = document.createElement("span");
@@ -923,23 +1277,31 @@
         setBusy(true, "Enviando arquivo");
         try {
           const response = await fetch("/upload", { method: "POST", body: form });
-          const payload = await response.json();
+          const payload = await readResponsePayload(response);
           if (!response.ok) {
             throw new Error(payload.detail || "Falha no upload.");
           }
 
           sessionId = payload.session_id;
+          sessionUnits = Array.isArray(payload.units) ? payload.units : [];
+          lastResult = null;
           lastUserMessage = "";
           mapState = { explored: [], pending: [], nodeCount: 0 };
           chatLog.innerHTML = "";
-          appendMessage("system", `Sessão iniciada: ${sessionId}`);
-          appendMessage("bot", payload.response);
+          const uploadedFilename = payload.filename || file.name;
+          const uploadedUnits = Array.isArray(payload.units) ? payload.units : [];
+          appendMessage("bot", formatUploadSummary(uploadedFilename, uploadedUnits));
           updateSidebar();
           setBusy(false, "Arquivo carregado");
           serverStatus.textContent = "Ativo";
           sessionStatus.textContent = sessionId;
         } catch (error) {
-          appendMessage("system", `Erro no upload: ${error.message}`);
+          const message = String(error && error.message ? error.message : error);
+          const hint =
+            message === "Failed to fetch" || message.includes("NetworkError")
+              ? " Servidor inativo? Na pasta do projeto rode: make core-api e make web (http://127.0.0.1:8080/)."
+              : "";
+          appendMessage("system", `Erro no upload: ${message}.${hint}`);
           setBusy(false, "Falha no upload");
           serverStatus.textContent = "Falha";
         }
@@ -950,35 +1312,45 @@
         const message = messageInput.value.trim();
         if (!message || !sessionId) return;
 
-        lastUserMessage = message;
-        appendMessage("user", message);
         messageInput.value = "";
-        setBusy(true, "Processando mensagem");
-
-        try {
-          const response = await fetch("/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: sessionId, message }),
-          });
-          const payload = await response.json();
-          if (!response.ok) {
-            throw new Error(payload.detail || "Falha no chat.");
-          }
-
-          appendMessage("bot", payload.response);
-          setBusy(false, "Sessão ativa");
-          serverStatus.textContent = "Ativo";
-        } catch (error) {
-          appendMessage("system", `Erro no chat: ${error.message}`);
-          setBusy(false, "Falha no chat");
-          serverStatus.textContent = "Falha";
+        if (shouldUseAssist(message)) {
+          await sendAssistMessage(message);
+          return;
         }
+        await sendStructuredMessage(message);
       }
 
       fileInput.addEventListener("change", setFileNameLabel);
       uploadButton.addEventListener("click", uploadFile);
       chatForm.addEventListener("submit", sendMessage);
+
+      function resetToCleanState() {
+        sessionId = "";
+        sessionUnits = [];
+        lastResult = null;
+        lastUserMessage = "";
+        mapState = { explored: [], pending: [], nodeCount: 0 };
+        chatLog.innerHTML = "";
+        appendMessage(
+          "system",
+          "Faça upload de um arquivo SQLite, CSV ou Parquet para iniciar a sessão."
+        );
+        fileInput.value = "";
+        setFileNameLabel();
+        messageInput.value = "";
+        messageInput.disabled = true;
+        sendButton.disabled = true;
+        uploadButton.disabled = false;
+        serverStatus.textContent = "Aguardando conexão";
+        updateSidebar();
+      }
+
+      window.addEventListener("pageshow", (event) => {
+        if (event.persisted) {
+          resetToCleanState();
+        }
+      });
+
       updateSidebar();
       updateStatusBar();
     </script>
