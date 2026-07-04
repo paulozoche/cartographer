@@ -102,6 +102,10 @@ def test_chat_confirmation_without_pending(mock_async_client: AsyncMock, client:
         200,
         json={"session_id": "sess-123", "units": ["data", "orders"]},
     )
+    mock_async_client.post.return_value = httpx.Response(
+        200,
+        json={"response": "Não há ação pendente.", "session_id": "sess-123"},
+    )
 
     response = client.post(
         "/chat",
@@ -113,7 +117,9 @@ def test_chat_confirmation_without_pending(mock_async_client: AsyncMock, client:
         "response": "Não há ação pendente.",
         "session_id": "sess-123",
     }
-    mock_async_client.post.assert_not_called()
+    payload = mock_async_client.post.call_args.kwargs["json"]
+    assert payload["message"] == "sim"
+    assert payload["pending_action"] is None
 
 
 def test_chat_confirmation_executes_pending_action(mock_async_client: AsyncMock, client: TestClient) -> None:
@@ -127,7 +133,11 @@ def test_chat_confirmation_executes_pending_action(mock_async_client: AsyncMock,
     )
     mock_async_client.post.return_value = httpx.Response(
         200,
-        json={"response": "Análise concluída.", "session_id": "sess-123"},
+        json={
+            "response": "Análise concluída.",
+            "session_id": "sess-123",
+            "last_result": {"unit_name": "data", "summary": "ok"},
+        },
     )
 
     response = client.post(

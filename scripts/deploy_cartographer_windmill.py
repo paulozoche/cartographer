@@ -19,6 +19,7 @@ DEFAULT_WORKSPACE = "admins"
 FLOW_PATH = "f/cartographer/cartographer_chat"
 SCRIPT_PATHS = {
     "interpretar_intencao": "f/cartographer/interpretar_intencao",
+    "freio_acelerador": "f/cartographer/freio_acelerador",
     "chamar_core_api": "f/cartographer/chamar_core_api",
     "formatar_resposta": "f/cartographer/formatar_resposta",
 }
@@ -70,6 +71,24 @@ def _read_script(name: str) -> str:
 def _script_schema(content: str) -> dict:
     # Minimal schema; Windmill accepts empty object for scripts without typed args in metadata.
     if "user_message" in content and "session_id" in content and "core_result" not in content:
+        if "decide_delivery" in content or "delivery_plan" in content:
+            return {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "action": {"type": "string"},
+                    "unit_name": {"type": "string"},
+                    "column": {"type": "string"},
+                    "depth": {"type": "string"},
+                    "response": {"type": "string"},
+                    "suggested_action": {"type": "object"},
+                    "history": {"type": "array"},
+                    "last_result": {"type": "object"},
+                    "context_consumed": {"type": "integer"},
+                },
+                "required": ["session_id", "action"],
+            }
         if "unit_name" in content and "action" in content:
             return {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -104,6 +123,8 @@ def _script_schema(content: str) -> dict:
                 "core_result": {"type": "object"},
                 "session_id": {"type": "string"},
                 "action": {"type": "string", "default": "analyze_unit"},
+                "suggested_action": {"type": "object"},
+                "delivery_plan": {"type": "object"},
             },
             "required": ["core_result", "session_id"],
         }
@@ -261,23 +282,23 @@ def _flow_payload() -> dict:
                     },
                 },
                 {
-                    "id": "chamar_core_api",
-                    "summary": "Chamar Core API",
+                    "id": "freio_acelerador",
+                    "summary": "Freio/Acelerador — modo de entrega",
                     "value": {
                         "type": "script",
-                        "path": SCRIPT_PATHS["chamar_core_api"],
+                        "path": SCRIPT_PATHS["freio_acelerador"],
                         "input_transforms": {
                             "session_id": {
                                 "type": "javascript",
                                 "expr": "results.interpretar_intencao.session_id",
                             },
-                            "unit_name": {
-                                "type": "javascript",
-                                "expr": "results.interpretar_intencao.unit_name || ''",
-                            },
                             "action": {
                                 "type": "javascript",
                                 "expr": "results.interpretar_intencao.action",
+                            },
+                            "unit_name": {
+                                "type": "javascript",
+                                "expr": "results.interpretar_intencao.unit_name || ''",
                             },
                             "column": {
                                 "type": "javascript",
@@ -295,6 +316,52 @@ def _flow_payload() -> dict:
                                 "type": "javascript",
                                 "expr": "results.interpretar_intencao.suggested_action || null",
                             },
+                            "history": {
+                                "type": "javascript",
+                                "expr": "flow_input.history || []",
+                            },
+                            "last_result": {
+                                "type": "javascript",
+                                "expr": "flow_input.last_result || null",
+                            },
+                        },
+                    },
+                },
+                {
+                    "id": "chamar_core_api",
+                    "summary": "Chamar Core API",
+                    "value": {
+                        "type": "script",
+                        "path": SCRIPT_PATHS["chamar_core_api"],
+                        "input_transforms": {
+                            "session_id": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.session_id",
+                            },
+                            "unit_name": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.unit_name || ''",
+                            },
+                            "action": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.action",
+                            },
+                            "column": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.column || ''",
+                            },
+                            "depth": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.depth || 'layer2'",
+                            },
+                            "response": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.response || ''",
+                            },
+                            "suggested_action": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.suggested_action || null",
+                            },
                         },
                     },
                 },
@@ -311,15 +378,19 @@ def _flow_payload() -> dict:
                             },
                             "session_id": {
                                 "type": "javascript",
-                                "expr": "results.interpretar_intencao.session_id",
+                                "expr": "results.freio_acelerador.session_id",
                             },
                             "action": {
                                 "type": "javascript",
-                                "expr": "results.interpretar_intencao.action",
+                                "expr": "results.freio_acelerador.action",
                             },
                             "suggested_action": {
                                 "type": "javascript",
-                                "expr": "results.interpretar_intencao.suggested_action || null",
+                                "expr": "results.freio_acelerador.suggested_action || null",
+                            },
+                            "delivery_plan": {
+                                "type": "javascript",
+                                "expr": "results.freio_acelerador.delivery_plan || null",
                             },
                         },
                     },

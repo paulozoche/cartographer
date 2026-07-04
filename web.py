@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,12 +28,30 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 PROXY_TIMEOUT_SECONDS = 300.0
+DEBUG_MODE = os.getenv("DEBUG_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
-CONFIRMATION_WORDS = frozenset(
-    {"sim", "si", "ok", "confirme", "pode", "prossiga", "continue", "vai", "execute"}
-)
-ANALYSIS_PREFIXES = ("analise", "analisa", "analisar", "explore", "explorar")
+logger = logging.getLogger(__name__)
 
+
+class _DiagNoOp:
+    @staticmethod
+    def info(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    @staticmethod
+    def warning(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    @staticmethod
+    def error(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    @staticmethod
+    def exception(*args: Any, **kwargs: Any) -> None:
+        pass
+
+
+diag: _DiagNoOp | Any = _DiagNoOp()
 
 sessions: dict[str, dict[str, Any]] = {}
 
@@ -67,6 +86,210 @@ Responda SOMENTE com um JSON válido no formato:
 
 app = FastAPI(title="Cartographer Web Proxy")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+if DEBUG_MODE:
+    from debug_panel import Diag, install_debug_logging, register_debug_routes
+
+    diag = Diag()
+    register_debug_routes(app)
+
+    @app.on_event("startup")
+    async def _start_debug_logging() -> None:
+        install_debug_logging()
+else:
+
+    @app.get("/debug")
+    async def debug_page_disabled() -> None:
+        raise HTTPException(status_code=404, detail="Debug desativado")
+
+    @app.get("/api/debug/logs")
+    async def debug_logs_disabled() -> None:
+        raise HTTPException(status_code=404, detail="Debug desativado")
+
+
+_PREVIEW_LIMIT = 5000
+
+
+def _truncate_text(text: str) -> str:
+    if len(text) <= _PREVIEW_LIMIT:
+        return text
+    return f"{text[:_PREVIEW_LIMIT]}... [truncado, {len(text)} chars total]"
+
+
+def _preview_json(value: Any) -> str:
+    try:
+        return _truncate_text(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return _truncate_text(repr(value))
+
+
+def _response_preview(response: httpx.Response) -> str:
+    try:
+        text = response.text
+        if not text:
+            return "(vazio)"
+        try:
+            return _preview_json(response.json())
+        except Exception:
+            return _truncate_text(text)
+    except Exception:
+        return "(ilegível)"
+
+
+async def _core_api_get(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    context: str,
+) -> httpx.Response:
+    url = f"{CORE_API_URL}{path}"
+    if not DEBUG_MODE:
+        return await client.get(url)
+    start = time.perf_counter()
+    diag.info(f"{context}/core_api_request", method="GET", endpoint=path)
+    try:
+        response = await client.get(url)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.info(
+            f"{context}/core_api_response",
+            method="GET",
+            endpoint=path,
+            status=response.status_code,
+            elapsed_ms=elapsed_ms,
+            body=_response_preview(response),
+        )
+        return response
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.exception(
+            f"{context}/core_api_error",
+            exc,
+            method="GET",
+            endpoint=path,
+            elapsed_ms=elapsed_ms,
+        )
+        raise
+
+
+async def _core_api_post(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    context: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    url = f"{CORE_API_URL}{path}"
+    if not DEBUG_MODE:
+        return await client.post(url, **kwargs)
+    start = time.perf_counter()
+    detail = "json" if "json" in kwargs else "files" if "files" in kwargs else "empty"
+    diag.info(
+        f"{context}/core_api_request",
+        method="POST",
+        endpoint=path,
+        payload_type=detail,
+        payload=_preview_json(kwargs.get("json")) if "json" in kwargs else detail,
+    )
+    try:
+        response = await client.post(url, **kwargs)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.info(
+            f"{context}/core_api_response",
+            method="POST",
+            endpoint=path,
+            status=response.status_code,
+            elapsed_ms=elapsed_ms,
+            body=_response_preview(response),
+        )
+        return response
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.exception(
+            f"{context}/core_api_error",
+            exc,
+            method="POST",
+            endpoint=path,
+            elapsed_ms=elapsed_ms,
+        )
+        raise
+
+
+async def _windmill_post(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    *,
+    context: str,
+) -> httpx.Response:
+    if not DEBUG_MODE:
+        return await client.post(WINDMILL_WEBHOOK_URL, json=payload)
+    start = time.perf_counter()
+    diag.info(f"{context}/windmill_request", payload=_preview_json(payload))
+    try:
+        response = await client.post(WINDMILL_WEBHOOK_URL, json=payload)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.info(
+            f"{context}/windmill_response",
+            status=response.status_code,
+            elapsed_ms=elapsed_ms,
+            body=_response_preview(response),
+        )
+        return response
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.exception(
+            f"{context}/windmill_error",
+            exc,
+            elapsed_ms=elapsed_ms,
+        )
+        raise
+
+
+async def _deepseek_post(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    context: str,
+) -> httpx.Response:
+    if not DEBUG_MODE:
+        return await client.post(
+            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+    start = time.perf_counter()
+    safe_payload = {
+        **payload,
+        "messages": [
+            {**msg, "content": f"({len(str(msg.get('content', '')))} chars)"}
+            if msg.get("role") != "system"
+            else msg
+            for msg in payload.get("messages", [])
+        ],
+    }
+    diag.info(f"{context}/deepseek_request", payload=_preview_json(safe_payload))
+    try:
+        response = await client.post(
+            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.info(
+            f"{context}/deepseek_response",
+            status=response.status_code,
+            elapsed_ms=elapsed_ms,
+            body=_response_preview(response),
+        )
+        return response
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        diag.exception(
+            f"{context}/deepseek_error",
+            exc,
+            elapsed_ms=elapsed_ms,
+        )
+        raise
 
 
 class ChatRequest(BaseModel):
@@ -126,66 +349,9 @@ def _extract_upstream_detail(response: httpx.Response, service_name: str) -> str
     return f"{service_name} retornou HTTP {response.status_code}"
 
 
-def _is_short_confirmation(message: str) -> bool:
-    return message.lower().strip() in CONFIRMATION_WORDS
-
-
-def _normalize_action(action: dict[str, Any] | None, units: list[str]) -> dict[str, Any] | None:
-    if not isinstance(action, dict):
-        return None
-
-    action_name = str(action.get("action", "")).strip()
-    units_map = {unit.casefold(): unit for unit in units}
-
-    if action_name == "analyze_unit":
-        unit_name = str(action.get("unit_name", "")).strip()
-        canonical = units_map.get(unit_name.casefold())
-        if not canonical:
-            return None
-        return {"action": "analyze_unit", "unit_name": canonical}
-
-    if action_name == "analyze_vertical":
-        unit_name = str(action.get("unit_name", "")).strip()
-        column = str(action.get("column", "")).strip()
-        canonical = units_map.get(unit_name.casefold())
-        if not canonical or not column:
-            return None
-        depth = str(action.get("depth", "layer2")).strip() or "layer2"
-        return {
-            "action": "analyze_vertical",
-            "unit_name": canonical,
-            "column": column,
-            "depth": depth,
-        }
-
-    return None
-
-
 def _pending_action_from_assist(options: list[str]) -> dict[str, Any] | None:
     if len(options) == 1:
         return {"action": "analyze_unit", "unit_name": options[0]}
-    return None
-
-
-def _infer_action_from_message(message: str, units: list[str]) -> dict[str, Any] | None:
-    normalized = message.lower().strip()
-    for prefix in ANALYSIS_PREFIXES:
-        if not normalized.startswith(f"{prefix} "):
-            continue
-        remainder = message[len(prefix) :].strip()
-        if not remainder:
-            return None
-        units_by_length = sorted(units, key=len, reverse=True)
-        remainder_lower = remainder.lower()
-        for unit in units_by_length:
-            unit_lower = unit.lower()
-            if unit_lower == remainder_lower or unit_lower in remainder_lower:
-                return {"action": "analyze_unit", "unit_name": unit}
-        token = re.sub(r"^(?:a\s+)?tabela\s+(?:da|de|do|das|dos)\s+", "", remainder_lower).strip()
-        for unit in units_by_length:
-            unit_lower = unit.lower()
-            if token and (token in unit_lower or unit_lower in token):
-                return {"action": "analyze_unit", "unit_name": unit}
     return None
 
 
@@ -194,6 +360,12 @@ def _remember_executed_action(session: dict[str, Any], action: dict[str, Any] | 
         return
     session["last_action"] = dict(action)
     session["pending_action"] = None
+    if DEBUG_MODE:
+        diag.info(
+            "SESSION/action_executed",
+            last_action=action,
+            pending_action_cleared=True,
+        )
 
 
 def _append_history(session: dict[str, Any], role: str, content: str) -> None:
@@ -206,43 +378,85 @@ def _append_history(session: dict[str, Any], role: str, content: str) -> None:
 def _apply_windmill_session_updates(
     session: dict[str, Any],
     body: dict[str, Any],
-    *,
-    executed_action: dict[str, Any] | None = None,
 ) -> None:
     suggested_action = body.get("suggested_action")
     if isinstance(suggested_action, dict) and suggested_action.get("action"):
         session["pending_action"] = dict(suggested_action)
+        if DEBUG_MODE:
+            diag.info(
+                "SESSION/pending_action_set",
+                source="windmill_suggested_action",
+                pending_action=suggested_action,
+            )
         return
 
     if body.get("action") == "pending" and isinstance(body.get("suggested_action"), dict):
         session["pending_action"] = dict(body["suggested_action"])
+        if DEBUG_MODE:
+            diag.info(
+                "SESSION/pending_action_set",
+                source="windmill_action_pending",
+                pending_action=body["suggested_action"],
+            )
         return
 
     last_result = body.get("last_result")
     if isinstance(last_result, dict):
         session["last_result"] = last_result
-
-    if executed_action is not None:
-        _remember_executed_action(session, executed_action)
+        if DEBUG_MODE:
+            diag.info("SESSION/last_result_updated", last_result=last_result)
+        unit_name = str(last_result.get("unit_name", "")).strip()
+        if unit_name:
+            action_name = str(body.get("action", "")).strip()
+            column = str(
+                last_result.get("column") or last_result.get("column_name") or ""
+            ).strip()
+            if action_name == "analyze_vertical" or column:
+                _remember_executed_action(
+                    session,
+                    {
+                        "action": "analyze_vertical",
+                        "unit_name": unit_name,
+                        "column": column,
+                        "depth": str(last_result.get("depth", "layer2")).strip() or "layer2",
+                    },
+                )
+            else:
+                _remember_executed_action(
+                    session,
+                    {"action": "analyze_unit", "unit_name": unit_name},
+                )
+        return
 
 
 def _parse_windmill_chat_response(response: httpx.Response, fallback_session_id: str) -> tuple[ChatResponse, dict[str, Any]]:
     try:
         body = response.json()
-    except Exception:
+    except Exception as exc:
         text = response.text.strip()
+        if DEBUG_MODE:
+            diag.warning(
+                "CHAT/windmill_non_json_response",
+                raw_text=_truncate_text(text) if text else "(vazio)",
+            )
         if not text:
+            if DEBUG_MODE:
+                diag.error("CHAT/windmill_empty_response")
             raise HTTPException(
                 status_code=502,
                 detail="Windmill retornou resposta vazia",
-            )
-        return ChatResponse(response=text, session_id=fallback_session_id), {}, {}
+            ) from exc
+        return ChatResponse(response=text, session_id=fallback_session_id), {}
 
     if not isinstance(body, dict):
+        if DEBUG_MODE:
+            diag.warning("CHAT/windmill_unexpected_body", body_type=type(body).__name__)
         return ChatResponse(response=str(body), session_id=fallback_session_id), {}
 
     response_text = body.get("response")
     if response_text is None:
+        if DEBUG_MODE:
+            diag.error("CHAT/windmill_missing_response_field", body=_preview_json(body))
         raise HTTPException(
             status_code=502,
             detail="Windmill retornou JSON sem campo 'response'",
@@ -259,13 +473,23 @@ def _parse_windmill_chat_response(response: httpx.Response, fallback_session_id:
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload(file: UploadFile = File(...)) -> UploadResponse:
+    filename = file.filename or "upload"
     file_bytes = await file.read()
+    if DEBUG_MODE:
+        diag.info(
+            "UPLOAD/received",
+            filename=filename,
+            size_bytes=len(file_bytes),
+            content_type=file.content_type or "application/octet-stream",
+        )
     if not file_bytes:
+        if DEBUG_MODE:
+            diag.warning("UPLOAD/rejected", reason="arquivo_vazio", filename=filename)
         raise HTTPException(status_code=400, detail="Arquivo vazio.")
 
     files = {
         "file": (
-            file.filename or "upload",
+            filename,
             file_bytes,
             file.content_type or "application/octet-stream",
         )
@@ -273,22 +497,38 @@ async def upload(file: UploadFile = File(...)) -> UploadResponse:
 
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_SECONDS) as client:
-            upstream = await client.post(f"{CORE_API_URL}/sessions", files=files)
+            upstream = await _core_api_post(
+                client,
+                "/sessions",
+                context="UPLOAD",
+                files=files,
+            )
     except httpx.TimeoutException as exc:
+        if DEBUG_MODE:
+            diag.exception("UPLOAD/timeout", exc, service="core_api")
         raise HTTPException(
             status_code=504,
             detail="Timeout ao criar sessão no core_api",
         ) from exc
     except httpx.RequestError as exc:
+        if DEBUG_MODE:
+            diag.exception("UPLOAD/unavailable", exc, service="core_api")
         raise HTTPException(
             status_code=502,
             detail=f"core_api indisponível: {exc}",
         ) from exc
 
     if upstream.status_code >= 400:
+        detail = _extract_upstream_detail(upstream, "core_api")
+        if DEBUG_MODE:
+            diag.error(
+                "UPLOAD/core_api_error",
+                status=upstream.status_code,
+                detail=detail,
+            )
         raise HTTPException(
             status_code=upstream.status_code,
-            detail=_extract_upstream_detail(upstream, "core_api"),
+            detail=detail,
         )
 
     try:
@@ -298,15 +538,26 @@ async def upload(file: UploadFile = File(...)) -> UploadResponse:
         if not isinstance(units, list):
             raise ValueError("units inválido")
     except (KeyError, TypeError, ValueError) as exc:
+        if DEBUG_MODE:
+            diag.exception("UPLOAD/invalid_payload", exc)
         raise HTTPException(
             status_code=502,
             detail="core_api retornou payload inválido ao criar sessão",
         ) from exc
 
+    unit_names = [str(unit) for unit in units]
+    if DEBUG_MODE:
+        diag.info(
+            "UPLOAD/success",
+            session_id=session_id,
+            filename=filename,
+            size_bytes=len(file_bytes),
+            units=unit_names,
+        )
     return UploadResponse(
         session_id=session_id,
-        filename=file.filename or "upload",
-        units=[str(unit) for unit in units],
+        filename=filename,
+        units=unit_names,
     )
 
 
@@ -314,44 +565,53 @@ async def upload(file: UploadFile = File(...)) -> UploadResponse:
 async def chat(request: ChatRequest) -> ChatResponse:
     session_id = request.session_id.strip()
     if not session_id:
+        if DEBUG_MODE:
+            diag.warning("CHAT/rejected", reason="session_id_obrigatorio")
         raise HTTPException(status_code=400, detail="session_id obrigatório.")
 
     message = request.message.strip()
     if not message:
+        if DEBUG_MODE:
+            diag.warning("CHAT/rejected", reason="mensagem_vazia", session_id=session_id)
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
 
     session = _get_session(session_id)
+    if DEBUG_MODE:
+        diag.info(
+            "CHAT/received",
+            session_id=session_id,
+            message=message,
+            pending_action=session.get("pending_action"),
+            last_action=session.get("last_action"),
+        )
     _append_history(session, "user", message)
 
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_SECONDS) as client:
             units = await _fetch_session_units(client, session_id)
-    except HTTPException:
+    except HTTPException as exc:
+        if DEBUG_MODE:
+            diag.error(
+                "CHAT/session_validation_failed",
+                session_id=session_id,
+                status=exc.status_code,
+                detail=exc.detail,
+            )
         raise
     except httpx.TimeoutException as exc:
+        if DEBUG_MODE:
+            diag.exception("CHAT/timeout", exc, service="core_api")
         raise HTTPException(
             status_code=504,
             detail="Timeout ao validar sessão no core_api",
         ) from exc
     except httpx.RequestError as exc:
+        if DEBUG_MODE:
+            diag.exception("CHAT/unavailable", exc, service="core_api")
         raise HTTPException(
             status_code=502,
             detail=f"core_api indisponível: {exc}",
         ) from exc
-
-    executed_action: dict[str, Any] | None = None
-
-    if _is_short_confirmation(message):
-        normalized = _normalize_action(session.get("pending_action"), units)
-        if normalized is None:
-            response_text = "Não há ação pendente."
-            _append_history(session, "assistant", response_text)
-            return ChatResponse(response=response_text, session_id=session_id)
-        executed_action = normalized
-    else:
-        inferred = _infer_action_from_message(message, units)
-        if inferred is not None:
-            executed_action = inferred
 
     payload: dict[str, Any] = {
         "session_id": session_id,
@@ -364,33 +624,63 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_SECONDS) as client:
-            upstream = await client.post(WINDMILL_WEBHOOK_URL, json=payload)
+            upstream = await _windmill_post(client, payload, context="CHAT")
     except httpx.TimeoutException as exc:
+        if DEBUG_MODE:
+            diag.exception("CHAT/windmill_timeout", exc)
         raise HTTPException(
             status_code=504,
             detail="Timeout no webhook Windmill",
         ) from exc
     except httpx.RequestError as exc:
+        if DEBUG_MODE:
+            diag.exception("CHAT/windmill_unavailable", exc)
         raise HTTPException(
             status_code=502,
             detail=f"Windmill indisponível: {exc}",
         ) from exc
 
     if upstream.status_code >= 400:
+        detail = _extract_upstream_detail(upstream, "Windmill")
+        if DEBUG_MODE:
+            diag.error("CHAT/windmill_http_error", status=upstream.status_code, detail=detail)
         raise HTTPException(
             status_code=upstream.status_code,
-            detail=_extract_upstream_detail(upstream, "Windmill"),
+            detail=detail,
         )
 
     chat_response, windmill_body = _parse_windmill_chat_response(upstream, session_id)
-    _apply_windmill_session_updates(session, windmill_body, executed_action=executed_action)
+    if DEBUG_MODE:
+        diag.info(
+            "CHAT/windmill_parsed",
+            raw_body=_preview_json(windmill_body),
+            response_text=chat_response.response,
+        )
+    _apply_windmill_session_updates(session, windmill_body)
     _append_history(session, "assistant", chat_response.response)
 
+    if DEBUG_MODE:
+        diag.info(
+            "CHAT/response_sent",
+            session_id=session_id,
+            response=chat_response.response,
+            pending_action=session.get("pending_action"),
+            last_action=session.get("last_action"),
+        )
     return chat_response
 
 
-async def _fetch_session_units(client: httpx.AsyncClient, session_id: str) -> list[str]:
-    upstream = await client.get(f"{CORE_API_URL}/sessions/{session_id}/units")
+async def _fetch_session_units(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    context: str = "CHAT",
+) -> list[str]:
+    upstream = await _core_api_get(
+        client,
+        f"/sessions/{session_id}/units",
+        context=context,
+    )
     if upstream.status_code == 404:
         raise HTTPException(status_code=404, detail=f"Sessão não encontrada: {session_id}")
     if upstream.status_code >= 400:
@@ -405,6 +695,8 @@ async def _fetch_session_units(client: httpx.AsyncClient, session_id: str) -> li
             raise ValueError("units inválido")
         return [str(unit) for unit in units if str(unit).strip()]
     except (TypeError, ValueError) as exc:
+        if DEBUG_MODE:
+            diag.exception("CHAT/invalid_units_payload", exc, session_id=session_id)
         raise HTTPException(
             status_code=502,
             detail="core_api retornou lista de unidades inválida",
@@ -449,11 +741,15 @@ def _parse_assist_llm_content(content: str) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/invalid_llm_json", exc, content=_truncate_text(text))
         raise HTTPException(
             status_code=502,
             detail="DeepSeek retornou JSON inválido para /assist",
         ) from exc
     if not isinstance(payload, dict):
+        if DEBUG_MODE:
+            diag.error("ASSIST/invalid_llm_payload", payload_type=type(payload).__name__)
         raise HTTPException(
             status_code=502,
             detail="DeepSeek retornou payload inválido para /assist",
@@ -496,32 +792,42 @@ async def _call_deepseek_assist(user_prompt: str) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_SECONDS) as client:
-            upstream = await client.post(
-                f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
-                headers=headers,
-                json=payload,
+            upstream = await _deepseek_post(
+                client,
+                payload,
+                headers,
+                context="ASSIST",
             )
     except httpx.TimeoutException as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/deepseek_timeout", exc)
         raise HTTPException(
             status_code=504,
             detail="Timeout ao chamar DeepSeek para /assist",
         ) from exc
     except httpx.RequestError as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/deepseek_unavailable", exc)
         raise HTTPException(
             status_code=502,
             detail=f"DeepSeek indisponível: {exc}",
         ) from exc
 
     if upstream.status_code >= 400:
+        detail = _extract_upstream_detail(upstream, "DeepSeek")
+        if DEBUG_MODE:
+            diag.error("ASSIST/deepseek_http_error", status=upstream.status_code, detail=detail)
         raise HTTPException(
             status_code=upstream.status_code,
-            detail=_extract_upstream_detail(upstream, "DeepSeek"),
+            detail=detail,
         )
 
     try:
         body = upstream.json()
         content = str(body["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError) as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/deepseek_invalid_response", exc)
         raise HTTPException(
             status_code=502,
             detail="DeepSeek retornou resposta sem conteúdo para /assist",
@@ -534,29 +840,54 @@ async def _call_deepseek_assist(user_prompt: str) -> dict[str, Any]:
 async def assist(request: AssistRequest) -> AssistResponse:
     session_id = request.session_id.strip()
     if not session_id:
+        if DEBUG_MODE:
+            diag.warning("ASSIST/rejected", reason="session_id_obrigatorio")
         raise HTTPException(status_code=400, detail="session_id obrigatório.")
 
     message = request.message.strip()
     if not message:
+        if DEBUG_MODE:
+            diag.warning("ASSIST/rejected", reason="mensagem_vazia", session_id=session_id)
         raise HTTPException(status_code=400, detail="Mensagem vazia.")
+
+    if DEBUG_MODE:
+        diag.info(
+            "ASSIST/received",
+            session_id=session_id,
+            message=message,
+            context_units=request.context.units,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=PROXY_TIMEOUT_SECONDS) as client:
-            units = await _fetch_session_units(client, session_id)
-    except HTTPException:
+            units = await _fetch_session_units(client, session_id, context="ASSIST")
+    except HTTPException as exc:
+        if DEBUG_MODE:
+            diag.error(
+                "ASSIST/session_validation_failed",
+                session_id=session_id,
+                status=exc.status_code,
+                detail=exc.detail,
+            )
         raise
     except httpx.TimeoutException as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/timeout", exc, service="core_api")
         raise HTTPException(
             status_code=504,
             detail="Timeout ao validar sessão no core_api",
         ) from exc
     except httpx.RequestError as exc:
+        if DEBUG_MODE:
+            diag.exception("ASSIST/unavailable", exc, service="core_api")
         raise HTTPException(
             status_code=502,
             detail=f"core_api indisponível: {exc}",
         ) from exc
 
     if not units:
+        if DEBUG_MODE:
+            diag.warning("ASSIST/rejected", reason="sessao_sem_unidades", session_id=session_id)
         raise HTTPException(status_code=400, detail="Sessão sem unidades disponíveis.")
 
     user_prompt = _build_assist_user_prompt(
@@ -569,6 +900,13 @@ async def assist(request: AssistRequest) -> AssistResponse:
         llm_payload = await _call_deepseek_assist(user_prompt)
     except HTTPException as exc:
         if exc.status_code in {503, 502, 504}:
+            if DEBUG_MODE:
+                diag.warning(
+                    "ASSIST/fallback",
+                    reason="deepseek_indisponivel",
+                    status=exc.status_code,
+                    detail=exc.detail,
+                )
             return _fallback_assist_response(session_id, units)
         raise
 
@@ -584,11 +922,27 @@ async def assist(request: AssistRequest) -> AssistResponse:
     if not suggestion:
         fallback = _fallback_assist_response(session_id, options)
         suggestion = fallback.suggestion
+        if DEBUG_MODE:
+            diag.info("ASSIST/suggestion_fallback", suggestion=suggestion)
 
     pending = _pending_action_from_assist(options)
     if pending is not None:
         assist_session = _get_session(session_id)
         assist_session["pending_action"] = dict(pending)
+        if DEBUG_MODE:
+            diag.info(
+                "SESSION/pending_action_set",
+                source="assist_single_option",
+                pending_action=pending,
+            )
+
+    if DEBUG_MODE:
+        diag.info(
+            "ASSIST/response_sent",
+            session_id=session_id,
+            suggestion=suggestion,
+            options=options,
+        )
 
     return AssistResponse(
         suggestion=suggestion,

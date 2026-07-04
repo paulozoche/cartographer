@@ -23,10 +23,15 @@ from agnostic.infrastructure.source_resolver import resolve_source
 from core_api.core_service import CoreService
 from core_api.models import (
     AnalyzeHorizontalRequest,
+    AnalyzeUnitFullRequest,
     AnalyzeUnitRequest,
+    AnalyzeVerticalFullRequest,
     AnalyzeVerticalRequest,
+    AnalyzeVerticalFullResponse,
     RecallRequest,
     SessionCreateResponse,
+    SessionStructureResponse,
+    TabularUnitAnalysisFullResponse,
     UnitsResponse,
 )
 
@@ -65,6 +70,7 @@ async def create_session(file: UploadFile = File(...)) -> SessionCreateResponse:
         source = resolve_source(tmp_path)
         service = CoreService.from_source(source)
         session_id = str(uuid.uuid4())
+        service.bind_session(session_id)
         SESSIONS[session_id] = service
         return SessionCreateResponse(session_id=session_id, units=service.unit_names)
     except FileNotFoundError as exc:
@@ -79,6 +85,18 @@ async def create_session(file: UploadFile = File(...)) -> SessionCreateResponse:
 def list_session_units(session_id: str) -> UnitsResponse:
     service = _get_session_service(session_id)
     return UnitsResponse(session_id=session_id, units=service.unit_names)
+
+
+@app.get("/sessions/{session_id}/structure", response_model=SessionStructureResponse)
+def get_session_structure(session_id: str) -> SessionStructureResponse:
+    service = _get_session_service(session_id)
+    try:
+        payload = service.get_session_structure()
+        return SessionStructureResponse(session_id=session_id, **payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/sessions/{session_id}/analyze_unit")
@@ -103,8 +121,42 @@ def analyze_vertical(session_id: str, request: AnalyzeVerticalRequest) -> dict[s
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post(
+    "/sessions/{session_id}/analyze_unit_full",
+    response_model=TabularUnitAnalysisFullResponse,
+)
+def analyze_unit_full(
+    session_id: str,
+    request: AnalyzeUnitFullRequest,
+) -> TabularUnitAnalysisFullResponse:
+    service = _get_session_service(session_id)
+    try:
+        return service.analyze_unit_full(request.unit_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post(
+    "/sessions/{session_id}/analyze_vertical_full",
+    response_model=AnalyzeVerticalFullResponse,
+)
+def analyze_vertical_full(
+    session_id: str,
+    request: AnalyzeVerticalFullRequest,
+) -> AnalyzeVerticalFullResponse:
+    service = _get_session_service(session_id)
+    try:
+        return service.analyze_vertical_full(request.unit_name, request.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/sessions/{session_id}/analyze_horizontal")
-def analyze_horizontal(session_id: str, request: AnalyzeHorizontalRequest) -> dict[str, str]:
+def analyze_horizontal(session_id: str, request: AnalyzeHorizontalRequest) -> dict[str, object]:
     service = _get_session_service(session_id)
     try:
         return service.analyze_horizontal(request.unit_a, request.unit_b)

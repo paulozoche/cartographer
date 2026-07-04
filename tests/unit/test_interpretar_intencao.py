@@ -43,32 +43,19 @@ UNITS = [
 ]
 
 
-def test_extract_search_term_removes_keywords(intent_module) -> None:
-    assert intent_module._extract_search_term("analise facebook") == "facebook"
-    assert intent_module._extract_search_term("detalhe cord_id em person") == "cord_id"
-
-
-def test_partial_unit_matches(intent_module) -> None:
-    assert intent_module._partial_unit_matches("facebook", UNITS) == ["facebook_event_checkin"]
-    assert intent_module._partial_unit_matches("drivers", UNITS) == ["drivers_license"]
-    assert intent_module._partial_unit_matches("person", UNITS) == ["person"]
-
-
-def test_resolve_unit_name_partial(intent_module) -> None:
-    assert intent_module._resolve_unit_name("analise facebook", UNITS) == "facebook_event_checkin"
-    assert intent_module._resolve_unit_name("analise drivers", UNITS) == "drivers_license"
-    assert intent_module._resolve_unit_name("analise person", UNITS) == "person"
-
-
-def test_resolve_unit_name_no_match(intent_module) -> None:
-    with pytest.raises(ValueError, match="Nenhuma unidade encontrada"):
-        intent_module._resolve_unit_name("analise inexistente", UNITS)
-
-
-def test_main_analyze_unit_partial_match(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_analyze_unit_via_llm(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {
+            "action": "analyze_unit",
+            "unit_name": "facebook_event_checkin",
+        },
+    )
 
-    result = intent_module.main("analise facebook", "sess-1")
+    result = intent_module.main("quero ver a tabela do facebook", "sess-1")
     assert result == {
         "action": "analyze_unit",
         "unit_name": "facebook_event_checkin",
@@ -76,10 +63,21 @@ def test_main_analyze_unit_partial_match(intent_module, monkeypatch: pytest.Monk
     }
 
 
-def test_main_analyze_vertical(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_analyze_vertical_via_llm(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {
+            "action": "analyze_vertical",
+            "unit_name": "person",
+            "column": "cord_id",
+            "depth": "layer2",
+        },
+    )
 
-    result = intent_module.main("detalhe cord_id em person", "sess-1")
+    result = intent_module.main("me mostra a coluna cord_id em person", "sess-1")
     assert result == {
         "action": "analyze_vertical",
         "unit_name": "person",
@@ -149,24 +147,6 @@ def test_llm_clarify_on_ambiguity(intent_module, monkeypatch: pytest.MonkeyPatch
         intent_module.main("analise fitness", "sess-1")
 
 
-def test_resolve_unit_name_uses_llm_when_literal_fails(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        intent_module,
-        "_llm_interpret_intent",
-        lambda *_args, **_kwargs: {
-            "action": "analyze_unit",
-            "unit_name": "get_fit_now_member",
-        },
-    )
-
-    unit = intent_module._resolve_unit_name(
-        "analise academia",
-        FITNESS_UNITS,
-        api_key="test-key",
-    )
-    assert unit == "get_fit_now_member"
-
-
 def test_llm_pending_action(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: FITNESS_UNITS)
     monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
@@ -190,6 +170,12 @@ def test_llm_pending_action(intent_module, monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_confirmation_executes_pending_action(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {"action": "confirm"},
+    )
     pending = {"action": "analyze_unit", "unit_name": "person"}
 
     result = intent_module.main("sim", "sess-1", pending_action=pending)
@@ -203,6 +189,12 @@ def test_confirmation_executes_pending_action(intent_module, monkeypatch: pytest
 
 def test_confirmation_without_pending_returns_clarify(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {"action": "confirm"},
+    )
 
     result = intent_module.main("sim", "sess-1")
 
@@ -215,6 +207,12 @@ def test_confirmation_without_pending_returns_clarify(intent_module, monkeypatch
 
 def test_confirmation_ignores_last_action_without_pending(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {"action": "confirm"},
+    )
     last_action = {"action": "analyze_unit", "unit_name": "facebook_event_checkin"}
 
     result = intent_module.main("ok", "sess-1", last_action=last_action)
@@ -307,21 +305,22 @@ def test_invalid_numeric_selection_falls_back_to_llm(intent_module, monkeypatch:
 
 
 @pytest.mark.parametrize(
-    ("message", "pending"),
-    [
-        ("confirma.", {"action": "analyze_unit", "unit_name": "person"}),
-        ("okay!", {"action": "analyze_unit", "unit_name": "person"}),
-        ("beleza?", {"action": "analyze_unit", "unit_name": "person"}),
-        ("claro.", {"action": "analyze_unit", "unit_name": "person"}),
-    ],
+    "message",
+    ["confirma.", "okay!", "beleza?", "claro."],
 )
 def test_confirmation_with_punctuation_and_variants(
     intent_module,
     monkeypatch: pytest.MonkeyPatch,
     message: str,
-    pending: dict,
 ) -> None:
     monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        intent_module,
+        "_llm_interpret_intent",
+        lambda *_args, **_kwargs: {"action": "confirm"},
+    )
+    pending = {"action": "analyze_unit", "unit_name": "person"}
 
     result = intent_module.main(message, "sess-1", pending_action=pending)
 
@@ -330,3 +329,11 @@ def test_confirmation_with_punctuation_and_variants(
         "unit_name": "person",
         "session_id": "sess-1",
     }
+
+
+def test_main_requires_api_key(intent_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intent_module, "_fetch_units", lambda *_args, **_kwargs: UNITS)
+    monkeypatch.setattr(intent_module, "_get_api_key", lambda: None)
+
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        intent_module.main("quero ver os dados", "sess-1")

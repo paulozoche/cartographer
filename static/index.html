@@ -1020,98 +1020,6 @@
         maybeUpdateMapState(text);
       }
 
-      function isDirectAction(message) {
-        const lower = message.toLowerCase();
-        return /\b(analise|analisa|analyze|detalhe|detalhar|cruce|cruze|recall|mapa)\b/.test(lower);
-      }
-
-      function isVagueMessage(message) {
-        const lower = message.toLowerCase();
-        return /\b(quero|encontrar|me ajude|ajuda|help|como|onde|o que|qual|preciso|buscar|procurar|investigar)\b/.test(lower);
-      }
-
-      function shouldUseAssist(message) {
-        return isVagueMessage(message) && !isDirectAction(message);
-      }
-
-      function appendAssistMessage(suggestion, options) {
-        const node = document.createElement("div");
-        node.className = "message bot assist";
-
-        const header = document.createElement("div");
-        header.className = "message-header";
-
-        const label = document.createElement("div");
-        label.className = "message-label";
-        label.textContent = "Assistente";
-
-        const copyTextValue = [suggestion, ...(options || [])].join("\n");
-        const copyButton = createCopyButton(copyTextValue);
-
-        header.appendChild(label);
-        header.appendChild(copyButton);
-
-        const body = document.createElement("div");
-        body.className = "message-body";
-        body.textContent = suggestion;
-
-        if (Array.isArray(options) && options.length) {
-          const optionsWrap = document.createElement("div");
-          optionsWrap.className = "assist-options";
-          options.forEach((option) => {
-            const button = document.createElement("button");
-            button.type = "button";
-            button.className = "assist-option-button";
-            button.textContent = option;
-            button.addEventListener("click", () => {
-              sendStructuredMessage(`analise ${option}`);
-            });
-            optionsWrap.appendChild(button);
-          });
-          body.appendChild(optionsWrap);
-        }
-
-        node.appendChild(header);
-        node.appendChild(body);
-        chatLog.appendChild(node);
-        chatLog.scrollTop = chatLog.scrollHeight;
-      }
-
-      async function sendAssistMessage(message) {
-        if (!message || !sessionId) return;
-
-        lastUserMessage = message;
-        appendMessage("user", message);
-        setBusy(true, "Consultando assistente");
-
-        try {
-          const response = await fetch("/assist", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              session_id: sessionId,
-              message,
-              context: {
-                units: sessionUnits,
-                last_result: lastResult,
-              },
-            }),
-          });
-          const payload = await readResponsePayload(response);
-          if (!response.ok) {
-            throw new Error(payload.detail || "Falha no assistente.");
-          }
-
-          appendAssistMessage(payload.suggestion, payload.options);
-          setBusy(false, "Sessão ativa");
-          serverStatus.textContent = "Ativo";
-        } catch (error) {
-          appendMessage("system", `Erro no assistente: ${error.message}`);
-          setBusy(false, "Falha no assistente");
-          serverStatus.textContent = "Falha";
-        }
-      }
-
       async function sendStructuredMessage(message) {
         if (!message || !sessionId) return;
 
@@ -1313,10 +1221,6 @@
         if (!message || !sessionId) return;
 
         messageInput.value = "";
-        if (shouldUseAssist(message)) {
-          await sendAssistMessage(message);
-          return;
-        }
         await sendStructuredMessage(message);
       }
 

@@ -37,10 +37,9 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 
 pip install -r requirements.txt
-cd core_api && pip install -r requirements.txt && cd ..
 ```
 
-`python-multipart` is required for file uploads in both `web.py` (`POST /upload`) and `core_api` (`POST /sessions`). It is listed in the root `requirements.txt`; installing only `core_api/requirements.txt` in a separate venv is no longer supported.
+`python-multipart` is required for file uploads in both `web.py` (`POST /upload`) and `core_api` (`POST /sessions`) and is listed in `requirements.txt`.
 
 ### Web proxy (recomendado)
 
